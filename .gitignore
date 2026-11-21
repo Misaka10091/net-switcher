@@ -1,0 +1,5 @@
+/target
+*.pdb
+/net-switcher.exe
+/config.json
+/REQUIREMENTS.md
