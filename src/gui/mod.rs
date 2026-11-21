@@ -343,7 +343,11 @@ impl ConfigWindow {
         .detach();
     }
 
-    fn render_adapter_card(&self, adapter: &AdapterSummary, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_adapter_card(
+        &self,
+        adapter: &AdapterSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let selected = adapter
             .friendly_name
             .eq_ignore_ascii_case(&self.selected_interface);
@@ -440,9 +444,10 @@ impl ConfigWindow {
                     .text_color(rgb(0xcbd5e1))
                     .child(format!("IP: {}  ·  GW: {}", ip_text, gw_text)),
             )
+            .into_any_element()
     }
 
-    fn render_field(label: &str, input: Entity<TextInput>) -> impl IntoElement {
+    fn render_field(label: &str, input: Entity<TextInput>) -> gpui::AnyElement {
         div()
             .flex()
             .flex_col()
@@ -455,6 +460,7 @@ impl ConfigWindow {
                     .child(label.to_string()),
             )
             .child(input)
+            .into_any_element()
     }
 
     fn render_toggle_row(
@@ -463,7 +469,7 @@ impl ConfigWindow {
         checked: bool,
         on_toggle: impl Fn(&mut Self, &gpui::MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
         div()
             .id(id)
             .flex()
@@ -491,6 +497,7 @@ impl ConfigWindow {
                     .when(!checked, |this| this.justify_start())
                     .child(div().size(px(18.)).rounded_full().bg(rgb(0xffffff))),
             )
+            .into_any_element()
     }
 }
 
@@ -504,11 +511,10 @@ impl Render for ConfigWindow {
         };
 
         let switch_disabled = self.switching;
-        let adapter_cards: Vec<_> = self
-            .adapters
-            .iter()
-            .map(|a| self.render_adapter_card(a, cx))
-            .collect();
+        let mut adapter_cards = Vec::with_capacity(self.adapters.len());
+        for adapter in &self.adapters {
+            adapter_cards.push(self.render_adapter_card(adapter, cx));
+        }
 
         div()
             .on_action(|_: &CloseWindow, window, _| {
