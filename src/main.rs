@@ -30,6 +30,7 @@ fn main() {
     }
 
     let no_elevate = args.iter().any(|a| a == "--no-elevate");
+    let start_minimized = args.iter().any(|a| a == "--minimized" || a == "--tray-only");
 
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -37,7 +38,13 @@ fn main() {
 
     let lock = match winutil::acquire_single_instance(TRAY_MUTEX_NAME) {
         Ok(winutil::InstanceLock::Acquired(guard)) => guard,
-        Ok(winutil::InstanceLock::AlreadyRunning) => return,
+        Ok(winutil::InstanceLock::AlreadyRunning) => {
+            // If already running in tray, opening the exe again pops up / focuses the GPUI config window
+            if !start_minimized && !winutil::notify_tray_message(tray::TRAY_WINDOW_CLASS, tray::WM_APP_OPEN_GUI) {
+                let _ = winutil::launch_gui_process();
+            }
+            return;
+        }
         Err(e) => {
             winutil::show_error_box("Net Switcher 启动失败", &e);
             return;
@@ -52,19 +59,36 @@ fn main() {
     }
 
     let config_path = config::resolve_config_path();
-    let cfg = match config::load_config(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            winutil::show_error_box("Net Switcher 配置错误", &e);
-            return;
-        }
-    };
+    let cfg = load_or_default_config(&config_path);
 
-    if let Err(e) = tray::run(cfg, config_path) {
+    // Pop up GPUI config window on startup unless launched with --minimized (e.g. Windows autostart)
+    let open_gui_on_start = !start_minimized;
+    if let Err(e) = tray::run(cfg, config_path, open_gui_on_start) {
         winutil::show_error_box("Net Switcher 运行错误", &e);
     }
 
     drop(lock);
+}
+
+fn load_or_default_config(config_path: &std::path::Path) -> config::Config {
+    if config_path.exists() {
+        match config::load_config(config_path) {
+            Ok(c) => return c,
+            Err(e) => {
+                winutil::show_error_box(
+                    "Net Switcher 配置提示",
+                    &format!("{}\n\n将使用默认配置启动，你可以在配置界面中重新保存。", e),
+                );
+            }
+        }
+    }
+
+    let first_adapter = net::list_adapters()
+        .into_iter()
+        .next()
+        .map(|a| a.friendly_name)
+        .unwrap_or_else(|| "WLAN".to_string());
+    config::Config::default_for_interface(first_adapter)
 }
 
 fn run_gui_mode() {
@@ -74,7 +98,10 @@ fn run_gui_mode() {
 
     let _gui_lock = match winutil::acquire_single_instance(GUI_MUTEX_NAME) {
         Ok(winutil::InstanceLock::Acquired(guard)) => guard,
-        Ok(winutil::InstanceLock::AlreadyRunning) => return,
+        Ok(winutil::InstanceLock::AlreadyRunning) => {
+            let _ = winutil::focus_window_by_title(gui::GUI_WINDOW_TITLE);
+            return;
+        }
         Err(e) => {
             winutil::show_error_box("Net Switcher GUI 启动失败", &e);
             return;
@@ -82,26 +109,7 @@ fn run_gui_mode() {
     };
 
     let config_path = config::resolve_config_path();
-    let cfg = config::load_config(&config_path).unwrap_or_else(|_| {
-        let first_adapter = net::list_adapters()
-            .into_iter()
-            .next()
-            .map(|a| a.friendly_name)
-            .unwrap_or_else(|| "WLAN".to_string());
-        config::Config {
-            interface_name: first_adapter,
-            static_cfg: config::StaticConfig {
-                ip: "192.168.1.100".to_string(),
-                subnet_mask: "255.255.255.0".to_string(),
-                gateway: "192.168.1.2".to_string(),
-                gateway_metric: 0,
-                dns: vec!["192.168.1.1".to_string()],
-            },
-            dhcp: config::DhcpConfig::default(),
-            ui: config::UiConfig::default(),
-        }
-    });
-
+    let cfg = load_or_default_config(&config_path);
     gui::run(cfg, config_path);
 }
 
@@ -118,7 +126,7 @@ fn run_cli_status() {
                 "Interface   : {} (found={}, up={})",
                 st.interface_name, st.found, st.is_up
             );
-            println!("Mode        : {}", st.mode.display_name());
+            println!("Active Mode : {}", st.display_label());
             println!("DHCP Enabled: {}", st.dhcp_enabled);
             println!("IPv4        : {}", st.ipv4.as_deref().unwrap_or("-"));
             println!("Subnet Mask : {}", st.subnet_mask.as_deref().unwrap_or("-"));
@@ -131,6 +139,26 @@ fn run_cli_status() {
                     st.dns.join(", ")
                 }
             );
+            println!(
+                "Profiles    : {} total ({} on {})",
+                cfg.profiles.len(),
+                cfg.active_profiles().len(),
+                cfg.active_interface
+            );
+            for p in cfg.active_profiles() {
+                let mark = if st.matched_profile_id.as_deref() == Some(p.id.as_str()) {
+                    "*"
+                } else {
+                    " "
+                };
+                println!(
+                    "  [{}] {} ({}) - {}",
+                    mark,
+                    p.name,
+                    p.mode.short_label(),
+                    p.mode.summary()
+                );
+            }
             println!("Elevated    : {}", winutil::is_elevated());
             println!("Autostart   : {}", autostart::is_enabled());
         }

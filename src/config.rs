@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -6,38 +7,65 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    pub interface_name: String,
-    #[serde(rename = "static")]
-    pub static_cfg: StaticConfig,
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub active_interface: String,
     #[serde(default)]
-    pub dhcp: DhcpConfig,
+    pub profiles: Vec<NetworkProfile>,
     #[serde(default)]
     pub ui: UiConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct StaticConfig {
-    pub ip: String,
-    pub subnet_mask: String,
-    pub gateway: String,
-    #[serde(default)]
-    pub gateway_metric: u32,
-    #[serde(default)]
-    pub dns: Vec<String>,
+pub struct NetworkProfile {
+    pub id: String,
+    pub name: String,
+    pub interface_name: String,
+    pub mode: ProfileMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DhcpConfig {
-    #[serde(default = "default_true")]
-    pub renew_on_switch: bool,
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ProfileMode {
+    Dhcp {
+        #[serde(default = "default_true", rename = "renewOnSwitch")]
+        renew_on_switch: bool,
+    },
+    Static {
+        ip: String,
+        #[serde(rename = "subnetMask")]
+        subnet_mask: String,
+        gateway: String,
+        #[serde(default, rename = "gatewayMetric")]
+        gateway_metric: u32,
+        #[serde(default)]
+        dns: Vec<String>,
+    },
 }
 
-impl Default for DhcpConfig {
-    fn default() -> Self {
-        Self {
-            renew_on_switch: true,
+impl ProfileMode {
+    pub fn is_dhcp(&self) -> bool {
+        matches!(self, ProfileMode::Dhcp { .. })
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            ProfileMode::Dhcp { .. } => "DHCP",
+            ProfileMode::Static { .. } => "静态 IP",
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            ProfileMode::Dhcp { renew_on_switch } => {
+                if *renew_on_switch {
+                    "自动获取 IP/网关/DNS (切后刷新租约)".to_string()
+                } else {
+                    "自动获取 IP/网关/DNS".to_string()
+                }
+            }
+            ProfileMode::Static { ip, gateway, .. } => format!("{} → 网关 {}", ip, gateway),
         }
     }
 }
@@ -63,12 +91,117 @@ impl Default for UiConfig {
     }
 }
 
+fn default_version() -> u32 {
+    2
+}
+
 fn default_true() -> bool {
     true
 }
 
 fn default_refresh_interval() -> u32 {
     15
+}
+
+// Legacy v1 config format for seamless automatic migration
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyConfig {
+    interface_name: String,
+    #[serde(rename = "static")]
+    static_cfg: LegacyStaticConfig,
+    #[serde(default)]
+    dhcp: LegacyDhcpConfig,
+    #[serde(default)]
+    ui: UiConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyStaticConfig {
+    ip: String,
+    subnet_mask: String,
+    gateway: String,
+    #[serde(default)]
+    gateway_metric: u32,
+    #[serde(default)]
+    dns: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyDhcpConfig {
+    #[serde(default = "default_true")]
+    renew_on_switch: bool,
+}
+
+impl Default for LegacyDhcpConfig {
+    fn default() -> Self {
+        Self {
+            renew_on_switch: true,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ConfigFile {
+    V2(Config),
+    Legacy(LegacyConfig),
+}
+
+impl Config {
+    pub fn default_for_interface(interface_name: String) -> Self {
+        Self {
+            version: 2,
+            active_interface: interface_name.clone(),
+            profiles: vec![
+                NetworkProfile {
+                    id: "default-static".to_string(),
+                    name: "固定网关".to_string(),
+                    interface_name: interface_name.clone(),
+                    mode: ProfileMode::Static {
+                        ip: "192.168.1.100".to_string(),
+                        subnet_mask: "255.255.255.0".to_string(),
+                        gateway: "192.168.1.2".to_string(),
+                        gateway_metric: 0,
+                        dns: vec!["192.168.1.1".to_string()],
+                    },
+                },
+                NetworkProfile {
+                    id: "default-dhcp".to_string(),
+                    name: "DHCP 自动获取".to_string(),
+                    interface_name,
+                    mode: ProfileMode::Dhcp {
+                        renew_on_switch: true,
+                    },
+                },
+            ],
+            ui: UiConfig::default(),
+        }
+    }
+
+    pub fn profiles_for_interface(&self, iface: &str) -> Vec<&NetworkProfile> {
+        self.profiles
+            .iter()
+            .filter(|p| p.interface_name.eq_ignore_ascii_case(iface))
+            .collect()
+    }
+
+    pub fn active_profiles(&self) -> Vec<&NetworkProfile> {
+        self.profiles_for_interface(&self.active_interface)
+    }
+
+    pub fn next_profile_id(&self, prefix: &str) -> String {
+        let existing: HashSet<&str> = self.profiles.iter().map(|p| p.id.as_str()).collect();
+        for n in 1..10_000 {
+            let candidate = format!("{}-{}", prefix, n);
+            if !existing.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        format!("{}-extra", prefix)
+    }
 }
 
 pub fn resolve_config_path() -> PathBuf {
@@ -94,14 +227,53 @@ pub fn resolve_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("config.json"))
 }
 
+pub fn parse_config_str(raw: &str) -> Result<Config, String> {
+    let trimmed = raw.trim_start_matches('\u{feff}');
+    let parsed: ConfigFile =
+        serde_json::from_str(trimmed).map_err(|e| format!("JSON 格式解析失败: {}", e))?;
+
+    let cfg = match parsed {
+        ConfigFile::V2(mut c) => {
+            c.version = 2;
+            c
+        }
+        ConfigFile::Legacy(legacy) => Config {
+            version: 2,
+            active_interface: legacy.interface_name.clone(),
+            profiles: vec![
+                NetworkProfile {
+                    id: "migrated-static".to_string(),
+                    name: "固定网关".to_string(),
+                    interface_name: legacy.interface_name.clone(),
+                    mode: ProfileMode::Static {
+                        ip: legacy.static_cfg.ip,
+                        subnet_mask: legacy.static_cfg.subnet_mask,
+                        gateway: legacy.static_cfg.gateway,
+                        gateway_metric: legacy.static_cfg.gateway_metric,
+                        dns: legacy.static_cfg.dns,
+                    },
+                },
+                NetworkProfile {
+                    id: "migrated-dhcp".to_string(),
+                    name: "DHCP 自动获取".to_string(),
+                    interface_name: legacy.interface_name,
+                    mode: ProfileMode::Dhcp {
+                        renew_on_switch: legacy.dhcp.renew_on_switch,
+                    },
+                },
+            ],
+            ui: legacy.ui,
+        },
+    };
+
+    validate_config(&cfg)?;
+    Ok(cfg)
+}
+
 pub fn load_config(path: &Path) -> Result<Config, String> {
     let raw = fs::read_to_string(path)
         .map_err(|e| format!("无法读取配置文件 {}: {}", path.display(), e))?;
-    let trimmed = raw.trim_start_matches('\u{feff}');
-    let cfg: Config = serde_json::from_str(trimmed)
-        .map_err(|e| format!("解析配置文件 {} 失败: {}", path.display(), e))?;
-    validate_config(&cfg)?;
-    Ok(cfg)
+    parse_config_str(&raw).map_err(|e| format!("配置文件 {} 无效: {}", path.display(), e))
 }
 
 pub fn save_config(path: &Path, cfg: &Config) -> Result<(), String> {
@@ -113,35 +285,55 @@ pub fn save_config(path: &Path, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_config(cfg: &Config) -> Result<(), String> {
-    if cfg.interface_name.trim().is_empty() {
-        return Err("配置项 interfaceName 不能为空".to_string());
+pub fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
+    if profile.id.trim().is_empty() {
+        return Err("Profile ID 不能为空".to_string());
     }
-    cfg.static_cfg
-        .ip
-        .parse::<Ipv4Addr>()
-        .map_err(|_| format!("static.ip 不是有效的 IPv4 地址: {}", cfg.static_cfg.ip))?;
-    cfg.static_cfg
-        .subnet_mask
-        .parse::<Ipv4Addr>()
-        .map_err(|_| {
+    if profile.name.trim().is_empty() {
+        return Err("Profile 名称不能为空".to_string());
+    }
+    if profile.interface_name.trim().is_empty() {
+        return Err(format!("Profile「{}」未绑定目标网卡", profile.name));
+    }
+
+    if let ProfileMode::Static {
+        ip,
+        subnet_mask,
+        gateway,
+        dns,
+        ..
+    } = &profile.mode
+    {
+        ip.parse::<Ipv4Addr>()
+            .map_err(|_| format!("Profile「{}」的静态 IP 无效: {}", profile.name, ip))?;
+        subnet_mask.parse::<Ipv4Addr>().map_err(|_| {
             format!(
-                "static.subnetMask 不是有效的 IPv4 掩码: {}",
-                cfg.static_cfg.subnet_mask
+                "Profile「{}」的子网掩码无效: {}",
+                profile.name, subnet_mask
             )
         })?;
-    cfg.static_cfg
-        .gateway
-        .parse::<Ipv4Addr>()
-        .map_err(|_| {
-            format!(
-                "static.gateway 不是有效的 IPv4 地址: {}",
-                cfg.static_cfg.gateway
-            )
-        })?;
-    for dns in &cfg.static_cfg.dns {
-        dns.parse::<Ipv4Addr>()
-            .map_err(|_| format!("static.dns 包含无效的 IPv4 地址: {}", dns))?;
+        gateway
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("Profile「{}」的默认网关无效: {}", profile.name, gateway))?;
+        for d in dns {
+            d.parse::<Ipv4Addr>()
+                .map_err(|_| format!("Profile「{}」包含无效的 DNS 地址: {}", profile.name, d))?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_config(cfg: &Config) -> Result<(), String> {
+    if cfg.active_interface.trim().is_empty() {
+        return Err("activeInterface（当前目标网卡）不能为空".to_string());
+    }
+    let mut ids = HashSet::new();
+    for profile in &cfg.profiles {
+        validate_profile(profile)?;
+        if !ids.insert(profile.id.as_str()) {
+            return Err(format!("存在重复的 Profile ID: {}", profile.id));
+        }
     }
     Ok(())
 }
@@ -151,7 +343,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_project_config_format() {
+    fn migrates_legacy_v1_config() {
         let json = r#"{
           "interfaceName": "WLAN",
           "static": {
@@ -168,10 +360,58 @@ mod tests {
             "leftClickToggle": true
           }
         }"#;
-        let cfg: Config = serde_json::from_str(json).expect("valid config");
-        assert!(validate_config(&cfg).is_ok());
-        assert_eq!(cfg.interface_name, "WLAN");
-        assert_eq!(cfg.static_cfg.gateway, "192.168.1.2");
-        assert_eq!(cfg.static_cfg.dns, vec!["192.168.1.1"]);
+        let cfg = parse_config_str(json).expect("legacy config should migrate");
+        assert_eq!(cfg.version, 2);
+        assert_eq!(cfg.active_interface, "WLAN");
+        assert_eq!(cfg.profiles.len(), 2);
+        assert!(!cfg.profiles[0].mode.is_dhcp());
+        assert!(cfg.profiles[1].mode.is_dhcp());
+    }
+
+    #[test]
+    fn parses_v2_multi_profile_config() {
+        let json = r#"{
+          "version": 2,
+          "activeInterface": "WLAN",
+          "profiles": [
+            {
+              "id": "home-gw",
+              "name": "家庭旁路由",
+              "interfaceName": "WLAN",
+              "mode": {
+                "type": "static",
+                "ip": "192.168.1.100",
+                "subnetMask": "255.255.255.0",
+                "gateway": "192.168.1.2",
+                "gatewayMetric": 0,
+                "dns": ["192.168.1.1", "223.5.5.5"]
+              }
+            },
+            {
+              "id": "home-dhcp",
+              "name": "自动 DHCP",
+              "interfaceName": "WLAN",
+              "mode": {
+                "type": "dhcp",
+                "renewOnSwitch": true
+              }
+            },
+            {
+              "id": "office-eth",
+              "name": "办公室有线",
+              "interfaceName": "Ethernet",
+              "mode": {
+                "type": "static",
+                "ip": "10.0.0.50",
+                "subnetMask": "255.255.255.0",
+                "gateway": "10.0.0.1",
+                "dns": ["10.0.0.1"]
+              }
+            }
+          ]
+        }"#;
+        let cfg = parse_config_str(json).expect("v2 config should parse");
+        assert_eq!(cfg.active_profiles().len(), 2);
+        assert_eq!(cfg.profiles_for_interface("Ethernet").len(), 1);
     }
 }

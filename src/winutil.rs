@@ -15,7 +15,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MB_ICONERROR, MB_OK, MessageBoxW, PostMessageW, SW_SHOWNORMAL,
+    FindWindowW, MB_ICONERROR, MB_OK, MessageBoxW, PostMessageW, SW_RESTORE, SW_SHOWNORMAL,
+    SetForegroundWindow, ShowWindow,
 };
 
 pub fn to_wide_null(s: &str) -> Vec<u16> {
@@ -175,14 +176,29 @@ pub fn launch_gui_process() -> Result<(), String> {
     Ok(())
 }
 
-pub fn notify_tray_reload(class_name: &str, msg: u32) {
+pub fn notify_tray_message(class_name: &str, msg: u32) -> bool {
     let class_w = to_wide_null(class_name);
     unsafe {
         let hwnd = FindWindowW(class_w.as_ptr(), ptr::null());
         if !hwnd.is_null() {
             PostMessageW(hwnd, msg, 0, 0);
+            return true;
         }
     }
+    false
+}
+
+pub fn focus_window_by_title(title: &str) -> bool {
+    let title_w = to_wide_null(title);
+    unsafe {
+        let hwnd = FindWindowW(ptr::null(), title_w.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            return true;
+        }
+    }
+    false
 }
 
 pub fn show_error_box(title: &str, message: &str) {

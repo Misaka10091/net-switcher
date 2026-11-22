@@ -126,6 +126,7 @@ fn build_task_xml(exe_path: &str, work_dir: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{exe_escaped}</Command>
+      <Arguments>--minimized</Arguments>
       <WorkingDirectory>{dir_escaped}</WorkingDirectory>
     </Exec>
   </Actions>

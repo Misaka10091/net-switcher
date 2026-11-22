@@ -1,17 +1,32 @@
 {
-  "interfaceName": "WLAN",
-  "static": {
-    "ip": "192.168.1.100",
-    "subnetMask": "255.255.255.0",
-    "gateway": "192.168.1.2",
-    "gatewayMetric": 0,
-    "dns": [
-      "192.168.1.1"
-    ]
-  },
-  "dhcp": {
-    "renewOnSwitch": true
-  },
+  "version": 2,
+  "activeInterface": "WLAN",
+  "profiles": [
+    {
+      "id": "wlan-static-gateway",
+      "name": "旁路由固定网关",
+      "interfaceName": "WLAN",
+      "mode": {
+        "type": "static",
+        "ip": "192.168.1.100",
+        "subnetMask": "255.255.255.0",
+        "gateway": "192.168.1.2",
+        "gatewayMetric": 0,
+        "dns": [
+          "192.168.1.1"
+        ]
+      }
+    },
+    {
+      "id": "wlan-dhcp-auto",
+      "name": "DHCP 自动获取",
+      "interfaceName": "WLAN",
+      "mode": {
+        "type": "dhcp",
+        "renewOnSwitch": true
+      }
+    }
+  ],
   "ui": {
     "showNotifications": true,
     "refreshIntervalSeconds": 15,

@@ -16,7 +16,7 @@ use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::config::Config;
+use crate::config::{Config, NetworkProfile, ProfileMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkMode {
@@ -29,25 +29,10 @@ pub enum NetworkMode {
 impl NetworkMode {
     pub fn display_name(self) -> &'static str {
         match self {
-            NetworkMode::Static => "固定网关模式",
-            NetworkMode::StaticCustom => "静态模式 (自定义)",
-            NetworkMode::Dhcp => "DHCP 自动模式",
+            NetworkMode::Static => "静态 IP",
+            NetworkMode::StaticCustom => "静态 IP (未匹配 Profile)",
+            NetworkMode::Dhcp => "DHCP 自动",
             NetworkMode::Disconnected => "未连接 / 异常",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SwitchTarget {
-    Static,
-    Dhcp,
-}
-
-impl SwitchTarget {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            SwitchTarget::Static => "固定网关模式",
-            SwitchTarget::Dhcp => "DHCP 自动模式",
         }
     }
 }
@@ -63,12 +48,22 @@ pub struct NetworkStatus {
     pub gateway: Option<String>,
     pub dns: Vec<String>,
     pub mode: NetworkMode,
+    pub matched_profile_id: Option<String>,
+    pub matched_profile_name: Option<String>,
 }
 
 impl NetworkStatus {
-    pub fn tooltip_text(&self, switching: bool) -> String {
-        if switching {
-            return format!("{}\n正在切换网络模式...", self.interface_name);
+    pub fn display_label(&self) -> String {
+        if let Some(ref name) = self.matched_profile_name {
+            format!("{} ({})", name, self.mode.display_name())
+        } else {
+            self.mode.display_name().to_string()
+        }
+    }
+
+    pub fn tooltip_text(&self, switching_to: Option<&str>) -> String {
+        if let Some(target_name) = switching_to {
+            return format!("{}\n正在切换到「{}」...", self.interface_name, target_name);
         }
         if !self.found {
             return format!("{}\n未找到该网卡", self.interface_name);
@@ -83,7 +78,7 @@ impl NetworkStatus {
         format!(
             "{} [{}]\nIP: {}\nGW: {}\nDNS: {}",
             self.interface_name,
-            self.mode.display_name(),
+            self.display_label(),
             ip,
             gw,
             dns
@@ -150,9 +145,11 @@ pub fn list_adapters() -> Vec<AdapterSummary> {
         }
 
         adapters.sort_by(|a, b| {
-            b.is_up
-                .cmp(&a.is_up)
-                .then_with(|| a.friendly_name.to_lowercase().cmp(&b.friendly_name.to_lowercase()))
+            b.is_up.cmp(&a.is_up).then_with(|| {
+                a.friendly_name
+                    .to_lowercase()
+                    .cmp(&b.friendly_name.to_lowercase())
+            })
         });
         return adapters;
     }
@@ -217,136 +214,315 @@ fn extract_adapter_summary(adapter: &IP_ADAPTER_ADDRESSES_LH) -> AdapterSummary 
 }
 
 pub fn query_status(config: &Config) -> NetworkStatus {
-    let target_name = config.interface_name.trim();
-    let mut size: u32 = 16 * 1024;
-    let flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_PREFIX;
+    query_interface_status(&config.active_interface, &config.profiles)
+}
 
-    let mut buffer = vec![0u8; size as usize];
-    for _ in 0..3 {
-        let ret = unsafe {
-            GetAdaptersAddresses(
-                AF_INET as u32,
-                flags,
-                ptr::null_mut(),
-                buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
-                &mut size,
-            )
+pub fn query_interface_status(
+    interface_name: &str,
+    profiles: &[NetworkProfile],
+) -> NetworkStatus {
+    let target_name = interface_name.trim();
+    let adapters = list_adapters();
+
+    let matched_adapter = adapters
+        .iter()
+        .find(|a| a.friendly_name == target_name)
+        .or_else(|| {
+            adapters
+                .iter()
+                .find(|a| a.friendly_name.eq_ignore_ascii_case(target_name))
+        });
+
+    let Some(adapter) = matched_adapter else {
+        return NetworkStatus {
+            interface_name: target_name.to_string(),
+            found: false,
+            is_up: false,
+            dhcp_enabled: false,
+            ipv4: None,
+            subnet_mask: None,
+            gateway: None,
+            dns: Vec::new(),
+            mode: NetworkMode::Disconnected,
+            matched_profile_id: None,
+            matched_profile_name: None,
         };
-        if ret == ERROR_BUFFER_OVERFLOW {
-            buffer.resize(size as usize, 0);
-            continue;
-        }
-        if ret != NO_ERROR {
-            return disconnected_status(target_name, false);
-        }
-
-        let mut curr = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-        let mut fallback_match: Option<*const IP_ADAPTER_ADDRESSES_LH> = None;
-
-        while !curr.is_null() {
-            let adapter = unsafe { &*curr };
-            let friendly = unsafe { pwstr_to_string(adapter.FriendlyName) };
-            if friendly == target_name {
-                return extract_adapter_status(adapter, config);
-            }
-            if fallback_match.is_none() && friendly.eq_ignore_ascii_case(target_name) {
-                fallback_match = Some(curr);
-            }
-            curr = adapter.Next;
-        }
-
-        if let Some(ptr_match) = fallback_match {
-            let adapter = unsafe { &*ptr_match };
-            return extract_adapter_status(adapter, config);
-        }
-
-        return disconnected_status(target_name, false);
-    }
-
-    disconnected_status(target_name, false)
-}
-
-fn disconnected_status(interface_name: &str, found: bool) -> NetworkStatus {
-    NetworkStatus {
-        interface_name: interface_name.to_string(),
-        found,
-        is_up: false,
-        dhcp_enabled: false,
-        ipv4: None,
-        subnet_mask: None,
-        gateway: None,
-        dns: Vec::new(),
-        mode: NetworkMode::Disconnected,
-    }
-}
-
-fn extract_adapter_status(adapter: &IP_ADAPTER_ADDRESSES_LH, config: &Config) -> NetworkStatus {
-    let interface_name = unsafe { pwstr_to_string(adapter.FriendlyName) };
-    let is_up = adapter.OperStatus == IfOperStatusUp;
-    let flags = unsafe { adapter.Anonymous2.Flags };
-    let dhcp_enabled = (flags & IP_ADAPTER_DHCP_ENABLED) != 0;
-
-    let mut ipv4: Option<String> = None;
-    let mut subnet_mask: Option<String> = None;
-
-    let mut uni = adapter.FirstUnicastAddress;
-    while !uni.is_null() {
-        let u = unsafe { &*uni };
-        if let Some(ip) = sockaddr_to_ipv4(u.Address.lpSockaddr) {
-            ipv4 = Some(ip.to_string());
-            subnet_mask = Some(prefix_len_to_mask(u.OnLinkPrefixLength).to_string());
-            break;
-        }
-        uni = u.Next;
-    }
-
-    let mut gateway: Option<String> = None;
-    let mut gw = adapter.FirstGatewayAddress;
-    while !gw.is_null() {
-        let g = unsafe { &*gw };
-        if let Some(ip) = sockaddr_to_ipv4(g.Address.lpSockaddr) {
-            gateway = Some(ip.to_string());
-            break;
-        }
-        gw = g.Next;
-    }
-
-    let mut dns: Vec<String> = Vec::new();
-    let mut dns_ptr = adapter.FirstDnsServerAddress;
-    while !dns_ptr.is_null() {
-        let d = unsafe { &*dns_ptr };
-        if let Some(ip) = sockaddr_to_ipv4(d.Address.lpSockaddr) {
-            let s = ip.to_string();
-            if !dns.contains(&s) {
-                dns.push(s);
-            }
-        }
-        dns_ptr = d.Next;
-    }
-
-    let mode = if !is_up {
-        NetworkMode::Disconnected
-    } else if dhcp_enabled {
-        NetworkMode::Dhcp
-    } else if ipv4.as_deref() == Some(config.static_cfg.ip.as_str())
-        && gateway.as_deref() == Some(config.static_cfg.gateway.as_str())
-    {
-        NetworkMode::Static
-    } else {
-        NetworkMode::StaticCustom
     };
 
+    let (mode, matched_profile) = match_adapter_profile(adapter, profiles);
+
     NetworkStatus {
-        interface_name,
+        interface_name: adapter.friendly_name.clone(),
         found: true,
-        is_up,
-        dhcp_enabled,
-        ipv4,
-        subnet_mask,
-        gateway,
-        dns,
+        is_up: adapter.is_up,
+        dhcp_enabled: adapter.dhcp_enabled,
+        ipv4: adapter.ipv4.clone(),
+        subnet_mask: adapter.subnet_mask.clone(),
+        gateway: adapter.gateway.clone(),
+        dns: adapter.dns.clone(),
         mode,
+        matched_profile_id: matched_profile.map(|p| p.id.clone()),
+        matched_profile_name: matched_profile.map(|p| p.name.clone()),
     }
+}
+
+fn match_adapter_profile<'a>(
+    adapter: &AdapterSummary,
+    profiles: &'a [NetworkProfile],
+) -> (NetworkMode, Option<&'a NetworkProfile>) {
+    if !adapter.is_up {
+        return (NetworkMode::Disconnected, None);
+    }
+
+    let iface_profiles: Vec<&NetworkProfile> = profiles
+        .iter()
+        .filter(|p| p.interface_name.eq_ignore_ascii_case(&adapter.friendly_name))
+        .collect();
+
+    if adapter.dhcp_enabled {
+        let matched = iface_profiles.into_iter().find(|p| p.mode.is_dhcp());
+        return (NetworkMode::Dhcp, matched);
+    }
+
+    // Prefer exact static match including DNS, then fall back to IP + gateway match
+    let mut ip_gw_match: Option<&NetworkProfile> = None;
+    for p in iface_profiles {
+        if let ProfileMode::Static {
+            ip, gateway, dns, ..
+        } = &p.mode
+        {
+            if adapter.ipv4.as_deref() == Some(ip.as_str())
+                && adapter.gateway.as_deref() == Some(gateway.as_str())
+            {
+                if dns.is_empty() || adapter.dns == *dns {
+                    return (NetworkMode::Static, Some(p));
+                }
+                if ip_gw_match.is_none() {
+                    ip_gw_match = Some(p);
+                }
+            }
+        }
+    }
+
+    if let Some(p) = ip_gw_match {
+        (NetworkMode::Static, Some(p))
+    } else {
+        (NetworkMode::StaticCustom, None)
+    }
+}
+
+pub fn pick_next_profile<'a>(
+    config: &'a Config,
+    current: &NetworkStatus,
+) -> Option<&'a NetworkProfile> {
+    let profiles = config.active_profiles();
+    if profiles.is_empty() {
+        return None;
+    }
+    if profiles.len() == 1 {
+        return Some(profiles[0]);
+    }
+
+    if let Some(ref active_id) = current.matched_profile_id {
+        if let Some(idx) = profiles.iter().position(|p| p.id == *active_id) {
+            return Some(profiles[(idx + 1) % profiles.len()]);
+        }
+    }
+
+    // If current state didn't match a named profile, prefer switching to opposite DHCP/Static mode
+    profiles
+        .iter()
+        .copied()
+        .find(|p| p.mode.is_dhcp() != current.dhcp_enabled)
+        .or_else(|| Some(profiles[0]))
+}
+
+pub fn apply_profile(
+    profile: &NetworkProfile,
+    all_profiles: &[NetworkProfile],
+) -> Result<NetworkStatus, String> {
+    match &profile.mode {
+        ProfileMode::Static {
+            ip,
+            subnet_mask,
+            gateway,
+            gateway_metric,
+            dns,
+        } => apply_static_mode(
+            &profile.interface_name,
+            ip,
+            subnet_mask,
+            gateway,
+            *gateway_metric,
+            dns,
+            all_profiles,
+        ),
+        ProfileMode::Dhcp { renew_on_switch } => {
+            apply_dhcp_mode(&profile.interface_name, *renew_on_switch, all_profiles)
+        }
+    }
+}
+
+fn apply_static_mode(
+    iface: &str,
+    ip: &str,
+    subnet_mask: &str,
+    gateway: &str,
+    gateway_metric: u32,
+    dns: &[String],
+    all_profiles: &[NetworkProfile],
+) -> Result<NetworkStatus, String> {
+    let mut addr_args = vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "address".to_string(),
+        format!("name={}", iface),
+        "source=static".to_string(),
+        format!("address={}", ip),
+        format!("mask={}", subnet_mask),
+        format!("gateway={}", gateway),
+    ];
+    if gateway_metric > 0 {
+        addr_args.push(format!("gwmetric={}", gateway_metric));
+    }
+
+    let addr_out = run_hidden_command("netsh.exe", &addr_args)?;
+    if !addr_out.success {
+        return Err(format!(
+            "设置静态 IP/网关失败 (code={:?}): {}",
+            addr_out.code, addr_out.output
+        ));
+    }
+
+    if dns.is_empty() {
+        let dns_args = vec![
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "set".to_string(),
+            "dns".to_string(),
+            format!("name={}", iface),
+            "source=dhcp".to_string(),
+        ];
+        let _ = run_hidden_command("netsh.exe", &dns_args);
+    } else {
+        let primary_args = vec![
+            "interface".to_string(),
+            "ipv4".to_string(),
+            "set".to_string(),
+            "dns".to_string(),
+            format!("name={}", iface),
+            "source=static".to_string(),
+            format!("address={}", dns[0]),
+            "register=primary".to_string(),
+            "validate=no".to_string(),
+        ];
+        let dns_out = run_hidden_command("netsh.exe", &primary_args)?;
+        if !dns_out.success {
+            return Err(format!(
+                "设置静态主 DNS 失败 (code={:?}): {}",
+                dns_out.code, dns_out.output
+            ));
+        }
+
+        for (idx, dns_ip) in dns.iter().enumerate().skip(1) {
+            let add_args = vec![
+                "interface".to_string(),
+                "ipv4".to_string(),
+                "add".to_string(),
+                "dns".to_string(),
+                format!("name={}", iface),
+                format!("address={}", dns_ip),
+                format!("index={}", idx + 1),
+                "validate=no".to_string(),
+            ];
+            let add_out = run_hidden_command("netsh.exe", &add_args)?;
+            if !add_out.success {
+                return Err(format!(
+                    "设置静态备用 DNS {} 失败 (code={:?}): {}",
+                    dns_ip, add_out.code, add_out.output
+                ));
+            }
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(300));
+        let st = query_interface_status(iface, all_profiles);
+        if !st.dhcp_enabled
+            && st.ipv4.as_deref() == Some(ip)
+            && st.gateway.as_deref() == Some(gateway)
+        {
+            return Ok(st);
+        }
+        if Instant::now() >= deadline {
+            if !st.dhcp_enabled {
+                return Ok(st);
+            }
+            return Err(format!(
+                "已执行切换命令，但网卡状态未变为静态模式 ({})",
+                st.summary_line()
+            ));
+        }
+    }
+}
+
+fn apply_dhcp_mode(
+    iface: &str,
+    renew_on_switch: bool,
+    all_profiles: &[NetworkProfile],
+) -> Result<NetworkStatus, String> {
+    let addr_args = vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "address".to_string(),
+        format!("name={}", iface),
+        "source=dhcp".to_string(),
+    ];
+    let addr_res = run_hidden_command("netsh.exe", &addr_args)?;
+
+    let dns_args = vec![
+        "interface".to_string(),
+        "ipv4".to_string(),
+        "set".to_string(),
+        "dns".to_string(),
+        format!("name={}", iface),
+        "source=dhcp".to_string(),
+    ];
+    let dns_res = run_hidden_command("netsh.exe", &dns_args)?;
+
+    if renew_on_switch {
+        let renew_args = vec!["/renew".to_string(), iface.to_string()];
+        let _ = run_hidden_command("ipconfig.exe", &renew_args);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(7);
+    let mut last_status = query_interface_status(iface, all_profiles);
+    while Instant::now() < deadline {
+        if last_status.dhcp_enabled
+            && last_status
+                .ipv4
+                .as_deref()
+                .map(|ip| !ip.starts_with("169.254."))
+                .unwrap_or(false)
+            && last_status.gateway.is_some()
+        {
+            return Ok(last_status);
+        }
+        std::thread::sleep(Duration::from_millis(350));
+        last_status = query_interface_status(iface, all_profiles);
+    }
+
+    if last_status.dhcp_enabled {
+        return Ok(last_status);
+    }
+
+    Err(format!(
+        "切换 DHCP 模式失败。address(code={:?}): {}; dns(code={:?}): {}",
+        addr_res.code, addr_res.output, dns_res.code, dns_res.output
+    ))
 }
 
 fn sockaddr_to_ipv4(sockaddr: *const SOCKADDR) -> Option<Ipv4Addr> {
@@ -384,168 +560,6 @@ unsafe fn pwstr_to_string(ptr: *const u16) -> String {
     }
     let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
     String::from_utf16_lossy(slice)
-}
-
-pub fn switch_mode(config: &Config, target: SwitchTarget) -> Result<NetworkStatus, String> {
-    match target {
-        SwitchTarget::Static => apply_static_mode(config),
-        SwitchTarget::Dhcp => apply_dhcp_mode(config),
-    }
-}
-
-fn apply_static_mode(config: &Config) -> Result<NetworkStatus, String> {
-    let iface = &config.interface_name;
-    let sc = &config.static_cfg;
-
-    let mut addr_args = vec![
-        "interface".to_string(),
-        "ipv4".to_string(),
-        "set".to_string(),
-        "address".to_string(),
-        format!("name={}", iface),
-        "source=static".to_string(),
-        format!("address={}", sc.ip),
-        format!("mask={}", sc.subnet_mask),
-        format!("gateway={}", sc.gateway),
-    ];
-    if sc.gateway_metric > 0 {
-        addr_args.push(format!("gwmetric={}", sc.gateway_metric));
-    }
-
-    let addr_out = run_hidden_command("netsh.exe", &addr_args)?;
-    if !addr_out.success {
-        return Err(format!(
-            "设置静态 IP/网关失败 (code={:?}): {}",
-            addr_out.code, addr_out.output
-        ));
-    }
-
-    if sc.dns.is_empty() {
-        let dns_args = vec![
-            "interface".to_string(),
-            "ipv4".to_string(),
-            "set".to_string(),
-            "dns".to_string(),
-            format!("name={}", iface),
-            "source=dhcp".to_string(),
-        ];
-        let _ = run_hidden_command("netsh.exe", &dns_args);
-    } else {
-        let primary_args = vec![
-            "interface".to_string(),
-            "ipv4".to_string(),
-            "set".to_string(),
-            "dns".to_string(),
-            format!("name={}", iface),
-            "source=static".to_string(),
-            format!("address={}", sc.dns[0]),
-            "register=primary".to_string(),
-            "validate=no".to_string(),
-        ];
-        let dns_out = run_hidden_command("netsh.exe", &primary_args)?;
-        if !dns_out.success {
-            return Err(format!(
-                "设置静态主 DNS 失败 (code={:?}): {}",
-                dns_out.code, dns_out.output
-            ));
-        }
-
-        for (idx, dns_ip) in sc.dns.iter().enumerate().skip(1) {
-            let add_args = vec![
-                "interface".to_string(),
-                "ipv4".to_string(),
-                "add".to_string(),
-                "dns".to_string(),
-                format!("name={}", iface),
-                format!("address={}", dns_ip),
-                format!("index={}", idx + 1),
-                "validate=no".to_string(),
-            ];
-            let add_out = run_hidden_command("netsh.exe", &add_args)?;
-            if !add_out.success {
-                return Err(format!(
-                    "设置静态备用 DNS {} 失败 (code={:?}): {}",
-                    dns_ip, add_out.code, add_out.output
-                ));
-            }
-        }
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        std::thread::sleep(Duration::from_millis(300));
-        let st = query_status(config);
-        if !st.dhcp_enabled
-            && st.ipv4.as_deref() == Some(sc.ip.as_str())
-            && st.gateway.as_deref() == Some(sc.gateway.as_str())
-        {
-            return Ok(st);
-        }
-        if Instant::now() >= deadline {
-            if !st.dhcp_enabled {
-                return Ok(st);
-            }
-            return Err(format!(
-                "已执行切换命令，但网卡状态未变为固定网关 ({})",
-                st.summary_line()
-            ));
-        }
-    }
-}
-
-fn apply_dhcp_mode(config: &Config) -> Result<NetworkStatus, String> {
-    let iface = &config.interface_name;
-
-    let addr_args = vec![
-        "interface".to_string(),
-        "ipv4".to_string(),
-        "set".to_string(),
-        "address".to_string(),
-        format!("name={}", iface),
-        "source=dhcp".to_string(),
-    ];
-    let addr_res = run_hidden_command("netsh.exe", &addr_args)?;
-
-    let dns_args = vec![
-        "interface".to_string(),
-        "ipv4".to_string(),
-        "set".to_string(),
-        "dns".to_string(),
-        format!("name={}", iface),
-        "source=dhcp".to_string(),
-    ];
-    let dns_res = run_hidden_command("netsh.exe", &dns_args)?;
-
-    if config.dhcp.renew_on_switch {
-        let renew_args = vec!["/renew".to_string(), iface.clone()];
-        let _ = run_hidden_command("ipconfig.exe", &renew_args);
-    }
-
-    let deadline = Instant::now() + Duration::from_secs(7);
-    let mut last_status = query_status(config);
-    while Instant::now() < deadline {
-        if last_status.dhcp_enabled
-            && last_status
-                .ipv4
-                .as_deref()
-                .map(|ip| !ip.starts_with("169.254."))
-                .unwrap_or(false)
-            && last_status.gateway.is_some()
-        {
-            return Ok(last_status);
-        }
-        std::thread::sleep(Duration::from_millis(350));
-        last_status = query_status(config);
-    }
-
-    if last_status.dhcp_enabled {
-        return Ok(last_status);
-    }
-
-    Err(format!(
-        "切换 DHCP 模式失败。address(code={:?}): {}; dns(code={:?}): {}",
-        addr_res.code, addr_res.output, dns_res.code, dns_res.output
-    ))
 }
 
 struct CmdOutput {
@@ -646,5 +660,70 @@ unsafe extern "system" fn ip_change_callback(
     let ctx = unsafe { &*(caller_context.cast::<WatcherCtx>()) };
     unsafe {
         PostMessageW(ctx.hwnd, ctx.msg, 0, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cycles_between_multiple_profiles() {
+        let cfg = Config {
+            version: 2,
+            active_interface: "WLAN".to_string(),
+            profiles: vec![
+                NetworkProfile {
+                    id: "p1".to_string(),
+                    name: "静态 A".to_string(),
+                    interface_name: "WLAN".to_string(),
+                    mode: ProfileMode::Static {
+                        ip: "192.168.1.10".to_string(),
+                        subnet_mask: "255.255.255.0".to_string(),
+                        gateway: "192.168.1.2".to_string(),
+                        gateway_metric: 0,
+                        dns: vec!["192.168.1.1".to_string()],
+                    },
+                },
+                NetworkProfile {
+                    id: "p2".to_string(),
+                    name: "静态 B".to_string(),
+                    interface_name: "WLAN".to_string(),
+                    mode: ProfileMode::Static {
+                        ip: "192.168.1.20".to_string(),
+                        subnet_mask: "255.255.255.0".to_string(),
+                        gateway: "192.168.1.3".to_string(),
+                        gateway_metric: 0,
+                        dns: vec!["192.168.1.1".to_string()],
+                    },
+                },
+                NetworkProfile {
+                    id: "p3".to_string(),
+                    name: "DHCP".to_string(),
+                    interface_name: "WLAN".to_string(),
+                    mode: ProfileMode::Dhcp {
+                        renew_on_switch: true,
+                    },
+                },
+            ],
+            ui: Default::default(),
+        };
+
+        let status = NetworkStatus {
+            interface_name: "WLAN".to_string(),
+            found: true,
+            is_up: true,
+            dhcp_enabled: false,
+            ipv4: Some("192.168.1.10".to_string()),
+            subnet_mask: Some("255.255.255.0".to_string()),
+            gateway: Some("192.168.1.2".to_string()),
+            dns: vec!["192.168.1.1".to_string()],
+            mode: NetworkMode::Static,
+            matched_profile_id: Some("p1".to_string()),
+            matched_profile_name: Some("静态 A".to_string()),
+        };
+
+        let next = pick_next_profile(&cfg, &status).unwrap();
+        assert_eq!(next.id, "p2");
     }
 }

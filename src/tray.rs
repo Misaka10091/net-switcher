@@ -19,10 +19,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::autostart;
-use crate::config::{Config, load_config};
+use crate::config::{Config, NetworkProfile, load_config, save_config};
+use crate::gui::GUI_WINDOW_TITLE;
 use crate::icon::{OwnedIcon, TrayVisualState, create_state_icon};
-use crate::net::{NetChangeWatcher, NetworkMode, NetworkStatus, SwitchTarget, query_status, switch_mode};
-use crate::winutil::{copy_to_wide_buf, launch_gui_process, open_file_in_shell, to_wide_null};
+use crate::net::{
+    NetChangeWatcher, NetworkMode, NetworkStatus, apply_profile, pick_next_profile, query_status,
+};
+use crate::winutil::{
+    copy_to_wide_buf, focus_window_by_title, launch_gui_process, open_file_in_shell, to_wide_null,
+};
 
 pub const TRAY_WINDOW_CLASS: &str = "NetSwitcherTrayWindowClass";
 const TRAY_ICON_ID: u32 = 1;
@@ -31,22 +36,22 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_NET_CHANGED: u32 = WM_APP + 2;
 const WM_APP_SWITCH_DONE: u32 = WM_APP + 3;
 pub const WM_APP_RELOAD_CONFIG: u32 = WM_APP + 4;
+pub const WM_APP_OPEN_GUI: u32 = WM_APP + 5;
 
 const TIMER_POLL_ID: usize = 1;
 const TIMER_DEBOUNCE_ID: usize = 2;
 
-const CMD_TOGGLE: u32 = 1001;
-const CMD_SET_STATIC: u32 = 1002;
-const CMD_SET_DHCP: u32 = 1003;
-const CMD_REFRESH: u32 = 1004;
-const CMD_OPEN_GUI: u32 = 1005;
-const CMD_OPEN_CONFIG: u32 = 1006;
-const CMD_RELOAD_CONFIG: u32 = 1007;
-const CMD_TOGGLE_AUTOSTART: u32 = 1008;
-const CMD_EXIT: u32 = 1009;
+const CMD_OPEN_GUI: u32 = 1001;
+const CMD_CYCLE_NEXT: u32 = 1002;
+const CMD_REFRESH: u32 = 1003;
+const CMD_OPEN_CONFIG: u32 = 1004;
+const CMD_RELOAD_CONFIG: u32 = 1005;
+const CMD_TOGGLE_AUTOSTART: u32 = 1006;
+const CMD_EXIT: u32 = 1007;
+const CMD_PROFILE_BASE: u32 = 2000;
 
 struct SwitchResult {
-    target: SwitchTarget,
+    profile: NetworkProfile,
     outcome: Result<NetworkStatus, String>,
 }
 
@@ -55,7 +60,7 @@ struct AppState {
     config_path: PathBuf,
     config: Config,
     status: NetworkStatus,
-    switching: bool,
+    switching_to: Option<String>,
     current_visual: Option<TrayVisualState>,
     current_icon: Option<OwnedIcon>,
     taskbar_created_msg: u32,
@@ -63,8 +68,12 @@ struct AppState {
 }
 
 impl AppState {
+    fn is_switching(&self) -> bool {
+        self.switching_to.is_some()
+    }
+
     fn desired_visual(&self) -> TrayVisualState {
-        if self.switching {
+        if self.is_switching() {
             return TrayVisualState::Switching;
         }
         match self.status.mode {
@@ -79,7 +88,6 @@ impl AppState {
         let visual = self.desired_visual();
         if self.current_visual != Some(visual) || self.current_icon.is_none() {
             let icon = create_state_icon(visual)?;
-            // Replacing self.current_icon automatically drops (DestroyIcon) the previous HICON
             self.current_icon = Some(icon);
             self.current_visual = Some(visual);
         }
@@ -97,7 +105,7 @@ impl AppState {
         if let Some(ref icon) = self.current_icon {
             nid.hIcon = icon.handle();
         }
-        let tip = self.status.tooltip_text(self.switching);
+        let tip = self.status.tooltip_text(self.switching_to.as_deref());
         copy_to_wide_buf(&tip, &mut nid.szTip);
 
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
@@ -119,7 +127,7 @@ impl AppState {
         if let Some(ref icon) = self.current_icon {
             nid.hIcon = icon.handle();
         }
-        let tip = self.status.tooltip_text(self.switching);
+        let tip = self.status.tooltip_text(self.switching_to.as_deref());
         copy_to_wide_buf(&tip, &mut nid.szTip);
 
         unsafe {
@@ -168,18 +176,37 @@ impl AppState {
         }
     }
 
-    fn start_switch(&mut self, target: SwitchTarget) {
-        if self.switching {
+    fn open_or_focus_gui(&self) {
+        if focus_window_by_title(GUI_WINDOW_TITLE) {
             return;
         }
-        self.switching = true;
+        if let Err(e) = launch_gui_process() {
+            self.show_notification("打开配置界面失败", &e, true);
+        }
+    }
+
+    fn start_apply_profile(&mut self, profile: NetworkProfile) {
+        if self.is_switching() {
+            return;
+        }
+        // If switching to a profile belonging to another interface, update active interface too
+        if !self
+            .config
+            .active_interface
+            .eq_ignore_ascii_case(&profile.interface_name)
+        {
+            self.config.active_interface = profile.interface_name.clone();
+            let _ = save_config(&self.config_path, &self.config);
+        }
+
+        self.switching_to = Some(profile.name.clone());
         self.update_tray_icon();
 
-        let cfg = self.config.clone();
+        let all_profiles = self.config.profiles.clone();
         let hwnd_raw = self.hwnd as isize;
         thread::spawn(move || {
-            let outcome = switch_mode(&cfg, target);
-            let boxed = Box::new(SwitchResult { target, outcome });
+            let outcome = apply_profile(&profile, &all_profiles);
+            let boxed = Box::new(SwitchResult { profile, outcome });
             let ptr = Box::into_raw(boxed) as LPARAM;
             unsafe {
                 PostMessageW(hwnd_raw as HWND, WM_APP_SWITCH_DONE, 0, ptr);
@@ -187,27 +214,29 @@ impl AppState {
         });
     }
 
-    fn toggle_mode(&mut self) {
-        if self.switching {
+    fn cycle_next_profile(&mut self) {
+        if self.is_switching() {
             return;
         }
         self.status = query_status(&self.config);
-        let target = match self.status.mode {
-            NetworkMode::Dhcp | NetworkMode::Disconnected | NetworkMode::StaticCustom => {
-                SwitchTarget::Static
-            }
-            NetworkMode::Static => SwitchTarget::Dhcp,
-        };
-        self.start_switch(target);
+        if let Some(next) = pick_next_profile(&self.config, &self.status).cloned() {
+            self.start_apply_profile(next);
+        } else {
+            self.open_or_focus_gui();
+        }
     }
 
     fn handle_switch_done(&mut self, res: SwitchResult) {
-        self.switching = false;
+        self.switching_to = None;
         match res.outcome {
             Ok(new_status) => {
                 self.status = new_status;
                 self.update_tray_icon();
-                let title = format!("已切换到 {}", res.target.display_name());
+                let title = format!(
+                    "已切换到「{}」({})",
+                    res.profile.name,
+                    res.profile.mode.short_label()
+                );
                 let body = format!(
                     "网卡: {}\n{}",
                     self.status.interface_name,
@@ -218,26 +247,34 @@ impl AppState {
             Err(err) => {
                 self.status = query_status(&self.config);
                 self.update_tray_icon();
-                let title = format!("切换到 {} 失败", res.target.display_name());
+                let title = format!("切换到「{}」失败", res.profile.name);
                 self.show_notification(&title, &err, true);
             }
         }
     }
 
-    fn reload_config(&mut self) {
+    fn reload_config(&mut self, notify: bool) {
         match load_config(&self.config_path) {
             Ok(new_cfg) => {
                 self.config = new_cfg;
                 self.reset_poll_timer();
                 self.refresh_status();
-                self.show_notification(
-                    "配置已重新加载",
-                    &format!("目标网卡: {}", self.config.interface_name),
-                    false,
-                );
+                if notify {
+                    self.show_notification(
+                        "配置已重新加载",
+                        &format!(
+                            "当前网卡: {} ({} 套 Profile)",
+                            self.config.active_interface,
+                            self.config.active_profiles().len()
+                        ),
+                        false,
+                    );
+                }
             }
             Err(e) => {
-                self.show_notification("重新加载配置失败", &e, true);
+                if notify {
+                    self.show_notification("重新加载配置失败", &e, true);
+                }
             }
         }
     }
@@ -247,7 +284,7 @@ impl AppState {
         match autostart::set_enabled(next) {
             Ok(()) => {
                 let msg = if next {
-                    "已开启登录时最高权限静默自启（免 UAC）"
+                    "已开启登录时静默托盘自启（免 UAC）"
                 } else {
                     "已关闭开机自启动"
                 };
@@ -260,13 +297,13 @@ impl AppState {
     }
 
     fn show_context_menu(&mut self) {
-        // Refresh status right before showing menu so summary is always up-to-date
-        if !self.switching {
+        if !self.is_switching() {
             self.status = query_status(&self.config);
             self.update_tray_icon();
         }
 
         let autostart_on = autostart::is_enabled();
+        let next_profile = pick_next_profile(&self.config, &self.status).cloned();
 
         unsafe {
             let menu = CreatePopupMenu();
@@ -274,13 +311,13 @@ impl AppState {
                 return;
             }
 
-            let header = if self.switching {
-                format!("网卡: {}  [正在切换...]", self.status.interface_name)
+            let header = if let Some(ref target) = self.switching_to {
+                format!("网卡: {}  [正在切换到 {}...]", self.status.interface_name, target)
             } else {
                 format!(
                     "网卡: {}  [{}]",
                     self.status.interface_name,
-                    self.status.mode.display_name()
+                    self.status.display_label()
                 )
             };
             let ip_gw = format!(
@@ -302,58 +339,85 @@ impl AppState {
             append_item(menu, MF_STRING | MF_GRAYED, 0, &dns_line);
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
-            let toggle_label = if self.switching {
-                "正在切换网络模式...".to_string()
-            } else {
-                match self.status.mode {
-                    NetworkMode::Static => "一键切换 → DHCP 自动模式".to_string(),
-                    _ => format!(
-                        "一键切换 → 固定网关 ({})",
-                        self.config.static_cfg.gateway
-                    ),
-                }
-            };
-            let switch_flags = if self.switching {
+            let switch_flags = if self.is_switching() {
                 MF_STRING | MF_GRAYED
             } else {
                 MF_STRING
             };
-            append_item(menu, switch_flags, CMD_TOGGLE as usize, &toggle_label);
-            SetMenuDefaultItem(menu, CMD_TOGGLE, 0);
 
-            let static_flags = switch_flags
-                | if self.status.mode == NetworkMode::Static {
-                    MF_CHECKED
+            if let Some(ref next) = next_profile {
+                let cycle_label = if let Some(ref target) = self.switching_to {
+                    format!("正在切换到「{}」...", target)
                 } else {
-                    0
+                    format!("一键切换 → {} ({})", next.name, next.mode.short_label())
                 };
-            let dhcp_flags = switch_flags
-                | if self.status.mode == NetworkMode::Dhcp {
-                    MF_CHECKED
-                } else {
-                    0
-                };
-            append_item(
-                menu,
-                static_flags,
-                CMD_SET_STATIC as usize,
-                &format!("切换到 固定网关模式 ({})", self.config.static_cfg.gateway),
-            );
-            append_item(
-                menu,
-                dhcp_flags,
-                CMD_SET_DHCP as usize,
-                "切换到 DHCP 自动模式",
-            );
+                append_item(menu, switch_flags, CMD_CYCLE_NEXT as usize, &cycle_label);
+                SetMenuDefaultItem(menu, CMD_CYCLE_NEXT, 0);
+                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            }
+
+            // Profiles for active interface
+            let mut has_active_profiles = false;
+            for (idx, p) in self.config.profiles.iter().enumerate() {
+                if !p
+                    .interface_name
+                    .eq_ignore_ascii_case(&self.config.active_interface)
+                {
+                    continue;
+                }
+                has_active_profiles = true;
+                let checked = self.status.matched_profile_id.as_deref() == Some(p.id.as_str());
+                let flags = switch_flags | if checked { MF_CHECKED } else { 0 };
+                let label = format!("{}  [{}]", p.name, p.mode.short_label());
+                append_item(menu, flags, (CMD_PROFILE_BASE as usize) + idx, &label);
+            }
+            if !has_active_profiles {
+                append_item(
+                    menu,
+                    MF_STRING | MF_GRAYED,
+                    0,
+                    "当前网卡暂无 Profile（请点击下方打开配置界面）",
+                );
+            }
+
+            // Profiles bound to other interfaces (if any)
+            let mut other_started = false;
+            for (idx, p) in self.config.profiles.iter().enumerate() {
+                if p.interface_name
+                    .eq_ignore_ascii_case(&self.config.active_interface)
+                {
+                    continue;
+                }
+                if !other_started {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+                    append_item(menu, MF_STRING | MF_GRAYED, 0, "其他网卡的 Profile:");
+                    other_started = true;
+                }
+                let label = format!(
+                    "[{}] {}  ({})",
+                    p.interface_name,
+                    p.name,
+                    p.mode.short_label()
+                );
+                append_item(menu, switch_flags, (CMD_PROFILE_BASE as usize) + idx, &label);
+            }
 
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-            append_item(menu, MF_STRING, CMD_OPEN_GUI as usize, "网卡与网络配置 (GUI)...");
+            append_item(
+                menu,
+                MF_STRING,
+                CMD_OPEN_GUI as usize,
+                "网卡与 Profile 配置界面 (GPUI)...",
+            );
+            if next_profile.is_none() {
+                SetMenuDefaultItem(menu, CMD_OPEN_GUI, 0);
+            }
             append_item(menu, MF_STRING, CMD_REFRESH as usize, "立即刷新状态");
             append_item(
                 menu,
                 MF_STRING,
                 CMD_OPEN_CONFIG as usize,
-                "打开配置文件 (config.json)",
+                "编辑配置文件 (config.json)",
             );
             append_item(menu, MF_STRING, CMD_RELOAD_CONFIG as usize, "重新加载配置");
 
@@ -363,7 +427,7 @@ impl AppState {
                 menu,
                 auto_flags,
                 CMD_TOGGLE_AUTOSTART as usize,
-                "开机自启动 (任务计划免 UAC)",
+                "开机静默自启动 (任务计划免 UAC)",
             );
 
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
@@ -385,22 +449,24 @@ impl AppState {
             PostMessageW(self.hwnd, WM_NULL, 0, 0);
             DestroyMenu(menu);
 
-            match cmd {
-                CMD_TOGGLE => self.toggle_mode(),
-                CMD_SET_STATIC => self.start_switch(SwitchTarget::Static),
-                CMD_SET_DHCP => self.start_switch(SwitchTarget::Dhcp),
-                CMD_OPEN_GUI => {
-                    if let Err(e) = launch_gui_process() {
-                        self.show_notification("打开配置界面失败", &e, true);
-                    }
+            if cmd >= CMD_PROFILE_BASE {
+                let idx = (cmd - CMD_PROFILE_BASE) as usize;
+                if let Some(profile) = self.config.profiles.get(idx).cloned() {
+                    self.start_apply_profile(profile);
                 }
+                return;
+            }
+
+            match cmd {
+                CMD_CYCLE_NEXT => self.cycle_next_profile(),
+                CMD_OPEN_GUI => self.open_or_focus_gui(),
                 CMD_REFRESH => self.refresh_status(),
                 CMD_OPEN_CONFIG => {
                     if let Err(e) = open_file_in_shell(&self.config_path) {
                         self.show_notification("打开配置失败", &e, true);
                     }
                 }
-                CMD_RELOAD_CONFIG => self.reload_config(),
+                CMD_RELOAD_CONFIG => self.reload_config(true),
                 CMD_TOGGLE_AUTOSTART => self.toggle_autostart(),
                 CMD_EXIT => {
                     DestroyWindow(self.hwnd);
@@ -418,7 +484,7 @@ unsafe fn append_item(menu: *mut std::ffi::c_void, flags: u32, id: usize, text: 
     }
 }
 
-pub fn run(config: Config, config_path: PathBuf) -> Result<(), String> {
+pub fn run(config: Config, config_path: PathBuf, open_gui_on_start: bool) -> Result<(), String> {
     let class_name = to_wide_null(TRAY_WINDOW_CLASS);
     let window_title = to_wide_null("NetSwitcher");
     let taskbar_created_w = to_wide_null("TaskbarCreated");
@@ -469,7 +535,7 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<(), String> {
             config_path,
             config,
             status: initial_status,
-            switching: false,
+            switching_to: None,
             current_visual: None,
             current_icon: None,
             taskbar_created_msg,
@@ -478,6 +544,10 @@ pub fn run(config: Config, config_path: PathBuf) -> Result<(), String> {
 
         state.add_tray_icon()?;
         state.reset_poll_timer();
+
+        if open_gui_on_start {
+            state.open_or_focus_gui();
+        }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -513,7 +583,9 @@ unsafe extern "system" fn wnd_proc(
                 match mouse_msg {
                     WM_LBUTTONUP => {
                         if state.config.ui.left_click_toggle {
-                            state.toggle_mode();
+                            state.cycle_next_profile();
+                        } else {
+                            state.open_or_focus_gui();
                         }
                     }
                     WM_RBUTTONUP | WM_CONTEXTMENU => {
@@ -538,11 +610,11 @@ unsafe extern "system" fn wnd_proc(
                 return 0;
             }
             WM_APP_RELOAD_CONFIG => {
-                if let Ok(new_cfg) = load_config(&state.config_path) {
-                    state.config = new_cfg;
-                    state.reset_poll_timer();
-                    state.refresh_status();
-                }
+                state.reload_config(false);
+                return 0;
+            }
+            WM_APP_OPEN_GUI => {
+                state.open_or_focus_gui();
                 return 0;
             }
             WM_TIMER => {
@@ -550,10 +622,10 @@ unsafe extern "system" fn wnd_proc(
                     unsafe {
                         KillTimer(hwnd, TIMER_DEBOUNCE_ID);
                     }
-                    if !state.switching {
+                    if !state.is_switching() {
                         state.refresh_status();
                     }
-                } else if wparam == TIMER_POLL_ID && !state.switching {
+                } else if wparam == TIMER_POLL_ID && !state.is_switching() {
                     state.refresh_status();
                 }
                 return 0;
