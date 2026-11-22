@@ -4,7 +4,8 @@ use std::path::Path;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Security::{
@@ -15,8 +16,8 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MB_ICONERROR, MB_OK, MessageBoxW, PostMessageW, SW_RESTORE, SW_SHOWNORMAL,
-    SetForegroundWindow, ShowWindow,
+    ChangeWindowMessageFilterEx, FindWindowW, MB_ICONERROR, MB_OK, MSGFLT_ALLOW, MessageBoxW,
+    PostMessageW, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow,
 };
 
 pub fn to_wide_null(s: &str) -> Vec<u16> {
@@ -70,14 +71,25 @@ pub fn acquire_single_instance(mutex_name: &str) -> Result<InstanceLock, String>
     let wide = to_wide_null(mutex_name);
     unsafe {
         let handle = CreateMutexW(ptr::null(), 0, wide.as_ptr());
+        let err = GetLastError();
         if handle.is_null() {
-            return Err(format!("创建单实例互斥锁失败 (code={})", GetLastError()));
+            // If an elevated instance already holds the mutex, a non-elevated caller gets ERROR_ACCESS_DENIED.
+            if err == ERROR_ACCESS_DENIED || err == ERROR_ALREADY_EXISTS {
+                return Ok(InstanceLock::AlreadyRunning);
+            }
+            return Err(format!("创建单实例互斥锁失败 (code={})", err));
         }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        if err == ERROR_ALREADY_EXISTS {
             CloseHandle(handle);
             return Ok(InstanceLock::AlreadyRunning);
         }
         Ok(InstanceLock::Acquired(SingleInstanceGuard { handle }))
+    }
+}
+
+pub fn allow_uipi_message(hwnd: HWND, msg: u32) {
+    unsafe {
+        ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, ptr::null_mut());
     }
 }
 
@@ -159,20 +171,12 @@ pub fn open_file_in_shell(path: &Path) -> Result<(), String> {
         )
     };
     if (res as isize) <= 32 {
-        return Err(format!("打开文件失败: {} (code={})", path.display(), res as isize));
+        return Err(format!(
+            "打开文件失败: {} (code={})",
+            path.display(),
+            res as isize
+        ));
     }
-    Ok(())
-}
-
-pub fn launch_gui_process() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--gui");
-    if let Some(dir) = exe.parent() {
-        cmd.current_dir(dir);
-    }
-    cmd.spawn()
-        .map_err(|e| format!("启动配置窗口失败: {}", e))?;
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,47 +16,20 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Ipv6Setting {
-    #[default]
-    Keep,
-    Enable,
-    Disable,
-}
-
-impl Ipv6Setting {
-    pub fn display_name(self) -> &'static str {
-        match self {
-            Ipv6Setting::Keep => "保持不变",
-            Ipv6Setting::Enable => "开启 IPv6",
-            Ipv6Setting::Disable => "关闭 IPv6",
-        }
-    }
-
-    pub fn short_badge(self) -> Option<&'static str> {
-        match self {
-            Ipv6Setting::Keep => None,
-            Ipv6Setting::Enable => Some("开IPv6"),
-            Ipv6Setting::Disable => Some("关IPv6"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkProfile {
     pub id: String,
     pub name: String,
     pub interface_name: String,
-    pub mode: ProfileMode,
+    pub ipv4: Ipv4Config,
     #[serde(default)]
-    pub ipv6: Ipv6Setting,
+    pub ipv6: Ipv6Config,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum ProfileMode {
+pub enum Ipv4Config {
     Dhcp {
         #[serde(default = "default_true", rename = "renewOnSwitch")]
         renew_on_switch: bool,
@@ -71,31 +44,89 @@ pub enum ProfileMode {
         #[serde(default)]
         dns: Vec<String>,
     },
+    Disabled,
 }
 
-impl ProfileMode {
-    pub fn is_dhcp(&self) -> bool {
-        matches!(self, ProfileMode::Dhcp { .. })
-    }
-
+impl Ipv4Config {
     pub fn short_label(&self) -> &'static str {
         match self {
-            ProfileMode::Dhcp { .. } => "DHCP",
-            ProfileMode::Static { .. } => "静态 IP",
+            Ipv4Config::Dhcp { .. } => "v4:DHCP",
+            Ipv4Config::Static { .. } => "v4:静态",
+            Ipv4Config::Disabled => "v4:关",
         }
+    }
+
+    pub fn is_dhcp(&self) -> bool {
+        matches!(self, Ipv4Config::Dhcp { .. })
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Ipv4Config::Disabled)
     }
 
     pub fn summary(&self) -> String {
         match self {
-            ProfileMode::Dhcp { renew_on_switch } => {
+            Ipv4Config::Dhcp { renew_on_switch } => {
                 if *renew_on_switch {
-                    "自动获取 IP/网关/DNS (切后刷新租约)".to_string()
+                    "IPv4: DHCP(刷新租约)".to_string()
                 } else {
-                    "自动获取 IP/网关/DNS".to_string()
+                    "IPv4: DHCP".to_string()
                 }
             }
-            ProfileMode::Static { ip, gateway, .. } => format!("{} → 网关 {}", ip, gateway),
+            Ipv4Config::Static { ip, gateway, .. } => format!("IPv4: {} → {}", ip, gateway),
+            Ipv4Config::Disabled => "IPv4: 关闭".to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Ipv6Config {
+    #[default]
+    Dhcp,
+    Static {
+        ip: String,
+        #[serde(default = "default_ipv6_prefix", rename = "prefixLength")]
+        prefix_length: u8,
+        #[serde(default)]
+        gateway: String,
+        #[serde(default)]
+        dns: Vec<String>,
+    },
+    Disabled,
+}
+
+impl Ipv6Config {
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Ipv6Config::Dhcp => "v6:DHCP",
+            Ipv6Config::Static { .. } => "v6:静态",
+            Ipv6Config::Disabled => "v6:关",
+        }
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        matches!(self, Ipv6Config::Disabled)
+    }
+
+    pub fn summary(&self) -> String {
+        match self {
+            Ipv6Config::Dhcp => "IPv6: 自动".to_string(),
+            Ipv6Config::Static {
+                ip, prefix_length, ..
+            } => format!("IPv6: {}/{}", ip, prefix_length),
+            Ipv6Config::Disabled => "IPv6: 关闭".to_string(),
+        }
+    }
+}
+
+impl NetworkProfile {
+    pub fn short_mode_summary(&self) -> String {
+        format!("{} / {}", self.ipv4.short_label(), self.ipv6.short_label())
+    }
+
+    pub fn detail_summary(&self) -> String {
+        format!("{}  |  {}", self.ipv4.summary(), self.ipv6.summary())
     }
 }
 
@@ -121,7 +152,7 @@ impl Default for UiConfig {
 }
 
 fn default_version() -> u32 {
-    2
+    3
 }
 
 fn default_true() -> bool {
@@ -132,22 +163,48 @@ fn default_refresh_interval() -> u32 {
     15
 }
 
-// Legacy v1 config format for seamless automatic migration
+fn default_ipv6_prefix() -> u8 {
+    64
+}
+
+// Legacy v2 config format for seamless automatic migration
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LegacyConfig {
-    interface_name: String,
-    #[serde(rename = "static")]
-    static_cfg: LegacyStaticConfig,
+struct LegacyV2Config {
+    active_interface: String,
     #[serde(default)]
-    dhcp: LegacyDhcpConfig,
+    profiles: Vec<LegacyV2Profile>,
     #[serde(default)]
     ui: UiConfig,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LegacyStaticConfig {
+struct LegacyV2Profile {
+    id: String,
+    name: String,
+    interface_name: String,
+    mode: Ipv4Config,
+    #[serde(default)]
+    ipv6: Option<String>,
+}
+
+// Legacy v1 config format for seamless automatic migration
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV1Config {
+    interface_name: String,
+    #[serde(rename = "static")]
+    static_cfg: LegacyV1StaticConfig,
+    #[serde(default)]
+    dhcp: LegacyV1DhcpConfig,
+    #[serde(default)]
+    ui: UiConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyV1StaticConfig {
     ip: String,
     subnet_mask: String,
     gateway: String,
@@ -159,12 +216,12 @@ struct LegacyStaticConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct LegacyDhcpConfig {
+struct LegacyV1DhcpConfig {
     #[serde(default = "default_true")]
     renew_on_switch: bool,
 }
 
-impl Default for LegacyDhcpConfig {
+impl Default for LegacyV1DhcpConfig {
     fn default() -> Self {
         Self {
             renew_on_switch: true,
@@ -175,37 +232,38 @@ impl Default for LegacyDhcpConfig {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ConfigFile {
-    V2(Config),
-    Legacy(LegacyConfig),
+    V3(Config),
+    V2(LegacyV2Config),
+    V1(LegacyV1Config),
 }
 
 impl Config {
     pub fn default_for_interface(interface_name: String) -> Self {
         Self {
-            version: 2,
+            version: 3,
             active_interface: interface_name.clone(),
             profiles: vec![
                 NetworkProfile {
                     id: "default-static".to_string(),
                     name: "固定网关".to_string(),
                     interface_name: interface_name.clone(),
-                    mode: ProfileMode::Static {
+                    ipv4: Ipv4Config::Static {
                         ip: "192.168.1.100".to_string(),
                         subnet_mask: "255.255.255.0".to_string(),
                         gateway: "192.168.1.2".to_string(),
                         gateway_metric: 0,
                         dns: vec!["192.168.1.1".to_string()],
                     },
-                    ipv6: Ipv6Setting::Keep,
+                    ipv6: Ipv6Config::Disabled,
                 },
                 NetworkProfile {
                     id: "default-dhcp".to_string(),
                     name: "DHCP 自动获取".to_string(),
                     interface_name,
-                    mode: ProfileMode::Dhcp {
+                    ipv4: Ipv4Config::Dhcp {
                         renew_on_switch: true,
                     },
-                    ipv6: Ipv6Setting::Keep,
+                    ipv6: Ipv6Config::Dhcp,
                 },
             ],
             ui: UiConfig::default(),
@@ -264,35 +322,57 @@ pub fn parse_config_str(raw: &str) -> Result<Config, String> {
         serde_json::from_str(trimmed).map_err(|e| format!("JSON 格式解析失败: {}", e))?;
 
     let cfg = match parsed {
-        ConfigFile::V2(mut c) => {
-            c.version = 2;
+        ConfigFile::V3(mut c) => {
+            c.version = 3;
             c
         }
-        ConfigFile::Legacy(legacy) => Config {
-            version: 2,
+        ConfigFile::V2(v2) => Config {
+            version: 3,
+            active_interface: v2.active_interface,
+            profiles: v2
+                .profiles
+                .into_iter()
+                .map(|p| {
+                    let ipv6 = match p.ipv6.as_deref() {
+                        Some("disable") => Ipv6Config::Disabled,
+                        _ => Ipv6Config::Dhcp,
+                    };
+                    NetworkProfile {
+                        id: p.id,
+                        name: p.name,
+                        interface_name: p.interface_name,
+                        ipv4: p.mode,
+                        ipv6,
+                    }
+                })
+                .collect(),
+            ui: v2.ui,
+        },
+        ConfigFile::V1(legacy) => Config {
+            version: 3,
             active_interface: legacy.interface_name.clone(),
             profiles: vec![
                 NetworkProfile {
                     id: "migrated-static".to_string(),
                     name: "固定网关".to_string(),
                     interface_name: legacy.interface_name.clone(),
-                    mode: ProfileMode::Static {
+                    ipv4: Ipv4Config::Static {
                         ip: legacy.static_cfg.ip,
                         subnet_mask: legacy.static_cfg.subnet_mask,
                         gateway: legacy.static_cfg.gateway,
                         gateway_metric: legacy.static_cfg.gateway_metric,
                         dns: legacy.static_cfg.dns,
                     },
-                    ipv6: Ipv6Setting::Keep,
+                    ipv6: Ipv6Config::Dhcp,
                 },
                 NetworkProfile {
                     id: "migrated-dhcp".to_string(),
                     name: "DHCP 自动获取".to_string(),
                     interface_name: legacy.interface_name,
-                    mode: ProfileMode::Dhcp {
+                    ipv4: Ipv4Config::Dhcp {
                         renew_on_switch: legacy.dhcp.renew_on_switch,
                     },
-                    ipv6: Ipv6Setting::Keep,
+                    ipv6: Ipv6Config::Dhcp,
                 },
             ],
             ui: legacy.ui,
@@ -329,16 +409,16 @@ pub fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
         return Err(format!("Profile「{}」未绑定目标网卡", profile.name));
     }
 
-    if let ProfileMode::Static {
+    if let Ipv4Config::Static {
         ip,
         subnet_mask,
         gateway,
         dns,
         ..
-    } = &profile.mode
+    } = &profile.ipv4
     {
         ip.parse::<Ipv4Addr>()
-            .map_err(|_| format!("Profile「{}」的静态 IP 无效: {}", profile.name, ip))?;
+            .map_err(|_| format!("Profile「{}」的静态 IPv4 无效: {}", profile.name, ip))?;
         subnet_mask.parse::<Ipv4Addr>().map_err(|_| {
             format!(
                 "Profile「{}」的子网掩码无效: {}",
@@ -347,10 +427,38 @@ pub fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
         })?;
         gateway
             .parse::<Ipv4Addr>()
-            .map_err(|_| format!("Profile「{}」的默认网关无效: {}", profile.name, gateway))?;
+            .map_err(|_| format!("Profile「{}」的 IPv4 网关无效: {}", profile.name, gateway))?;
         for d in dns {
-            d.parse::<Ipv4Addr>()
-                .map_err(|_| format!("Profile「{}」包含无效的 DNS 地址: {}", profile.name, d))?;
+            d.parse::<Ipv4Addr>().map_err(|_| {
+                format!("Profile「{}」包含无效的 IPv4 DNS: {}", profile.name, d)
+            })?;
+        }
+    }
+
+    if let Ipv6Config::Static {
+        ip,
+        prefix_length,
+        gateway,
+        dns,
+    } = &profile.ipv6
+    {
+        ip.parse::<Ipv6Addr>()
+            .map_err(|_| format!("Profile「{}」的静态 IPv6 无效: {}", profile.name, ip))?;
+        if *prefix_length == 0 || *prefix_length > 128 {
+            return Err(format!(
+                "Profile「{}」的 IPv6 前缀长度需在 1~128 之间: {}",
+                profile.name, prefix_length
+            ));
+        }
+        if !gateway.trim().is_empty() {
+            gateway.trim().parse::<Ipv6Addr>().map_err(|_| {
+                format!("Profile「{}」的 IPv6 网关无效: {}", profile.name, gateway)
+            })?;
+        }
+        for d in dns {
+            d.parse::<Ipv6Addr>().map_err(|_| {
+                format!("Profile「{}」包含无效的 IPv6 DNS: {}", profile.name, d)
+            })?;
         }
     }
 
@@ -386,23 +494,18 @@ mod tests {
             "gatewayMetric": 0,
             "dns": ["192.168.1.1"]
           },
-          "dhcp": { "renewOnSwitch": true },
-          "ui": {
-            "showNotifications": true,
-            "refreshIntervalSeconds": 15,
-            "leftClickToggle": true
-          }
+          "dhcp": { "renewOnSwitch": true }
         }"#;
-        let cfg = parse_config_str(json).expect("legacy config should migrate");
-        assert_eq!(cfg.version, 2);
+        let cfg = parse_config_str(json).expect("v1 config should migrate");
+        assert_eq!(cfg.version, 3);
         assert_eq!(cfg.active_interface, "WLAN");
         assert_eq!(cfg.profiles.len(), 2);
-        assert!(!cfg.profiles[0].mode.is_dhcp());
-        assert!(cfg.profiles[1].mode.is_dhcp());
+        assert!(!cfg.profiles[0].ipv4.is_dhcp());
+        assert!(cfg.profiles[1].ipv4.is_dhcp());
     }
 
     #[test]
-    fn parses_v2_multi_profile_config() {
+    fn migrates_legacy_v2_config() {
         let json = r#"{
           "version": 2,
           "activeInterface": "WLAN",
@@ -417,8 +520,7 @@ mod tests {
                 "ip": "192.168.1.100",
                 "subnetMask": "255.255.255.0",
                 "gateway": "192.168.1.2",
-                "gatewayMetric": 0,
-                "dns": ["192.168.1.1", "223.5.5.5"]
+                "dns": ["192.168.1.1"]
               }
             },
             {
@@ -426,30 +528,53 @@ mod tests {
               "name": "自动 DHCP",
               "interfaceName": "WLAN",
               "ipv6": "enable",
-              "mode": {
-                "type": "dhcp",
-                "renewOnSwitch": true
-              }
-            },
-            {
-              "id": "office-eth",
-              "name": "办公室有线",
-              "interfaceName": "Ethernet",
-              "mode": {
-                "type": "static",
-                "ip": "10.0.0.50",
-                "subnetMask": "255.255.255.0",
-                "gateway": "10.0.0.1",
-                "dns": ["10.0.0.1"]
-              }
+              "mode": { "type": "dhcp", "renewOnSwitch": true }
             }
           ]
         }"#;
-        let cfg = parse_config_str(json).expect("v2 config should parse");
-        assert_eq!(cfg.active_profiles().len(), 2);
-        assert_eq!(cfg.profiles_for_interface("Ethernet").len(), 1);
-        assert_eq!(cfg.profiles[0].ipv6, Ipv6Setting::Disable);
-        assert_eq!(cfg.profiles[1].ipv6, Ipv6Setting::Enable);
-        assert_eq!(cfg.profiles[2].ipv6, Ipv6Setting::Keep);
+        let cfg = parse_config_str(json).expect("v2 config should migrate");
+        assert_eq!(cfg.version, 3);
+        assert!(cfg.profiles[0].ipv6.is_disabled());
+        assert!(matches!(cfg.profiles[1].ipv6, Ipv6Config::Dhcp));
+    }
+
+    #[test]
+    fn parses_v3_independent_v4_v6_config() {
+        let json = r#"{
+          "version": 3,
+          "activeInterface": "WLAN",
+          "profiles": [
+            {
+              "id": "dual-static",
+              "name": "双栈静态",
+              "interfaceName": "WLAN",
+              "ipv4": {
+                "type": "static",
+                "ip": "192.168.1.100",
+                "subnetMask": "255.255.255.0",
+                "gateway": "192.168.1.2",
+                "dns": ["192.168.1.1"]
+              },
+              "ipv6": {
+                "type": "static",
+                "ip": "fd00::100",
+                "prefixLength": 64,
+                "gateway": "fd00::1",
+                "dns": ["2400:3200::1"]
+              }
+            },
+            {
+              "id": "v6-only",
+              "name": "纯 IPv6",
+              "interfaceName": "WLAN",
+              "ipv4": { "type": "disabled" },
+              "ipv6": { "type": "dhcp" }
+            }
+          ]
+        }"#;
+        let cfg = parse_config_str(json).expect("v3 config should parse");
+        assert_eq!(cfg.profiles.len(), 2);
+        assert!(matches!(cfg.profiles[0].ipv6, Ipv6Config::Static { .. }));
+        assert!(cfg.profiles[1].ipv4.is_disabled());
     }
 }

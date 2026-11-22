@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::mpsc::Sender;
 use std::thread;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -20,15 +21,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::autostart;
 use crate::config::{Config, NetworkProfile, load_config, save_config};
-use crate::gui::GUI_WINDOW_TITLE;
 use crate::icon::{OwnedIcon, TrayVisualState, create_state_icon};
 use crate::net::{
     NetChangeWatcher, NetworkMode, NetworkStatus, apply_profile, pick_next_profile, query_status,
-    set_interface_ipv6,
 };
-use crate::winutil::{
-    copy_to_wide_buf, focus_window_by_title, launch_gui_process, open_file_in_shell, to_wide_null,
-};
+use crate::winutil::{allow_uipi_message, copy_to_wide_buf, open_file_in_shell, to_wide_null};
 
 pub const TRAY_WINDOW_CLASS: &str = "NetSwitcherTrayWindowClass";
 const TRAY_ICON_ID: u32 = 1;
@@ -38,7 +35,6 @@ const WM_APP_NET_CHANGED: u32 = WM_APP + 2;
 const WM_APP_SWITCH_DONE: u32 = WM_APP + 3;
 pub const WM_APP_RELOAD_CONFIG: u32 = WM_APP + 4;
 pub const WM_APP_OPEN_GUI: u32 = WM_APP + 5;
-const WM_APP_IPV6_DONE: u32 = WM_APP + 6;
 
 const TIMER_POLL_ID: usize = 1;
 const TIMER_DEBOUNCE_ID: usize = 2;
@@ -49,17 +45,18 @@ const CMD_REFRESH: u32 = 1003;
 const CMD_OPEN_CONFIG: u32 = 1004;
 const CMD_RELOAD_CONFIG: u32 = 1005;
 const CMD_TOGGLE_AUTOSTART: u32 = 1006;
-const CMD_TOGGLE_IPV6: u32 = 1007;
-const CMD_EXIT: u32 = 1008;
+const CMD_EXIT: u32 = 1007;
 const CMD_PROFILE_BASE: u32 = 2000;
+
+#[derive(Debug, Clone, Copy)]
+pub enum GuiCommand {
+    OpenOrFocus,
+    Refresh,
+    Quit,
+}
 
 struct SwitchResult {
     profile: NetworkProfile,
-    outcome: Result<NetworkStatus, String>,
-}
-
-struct Ipv6Result {
-    enable: bool,
     outcome: Result<NetworkStatus, String>,
 }
 
@@ -72,6 +69,7 @@ struct AppState {
     current_visual: Option<TrayVisualState>,
     current_icon: Option<OwnedIcon>,
     taskbar_created_msg: u32,
+    gui_tx: Sender<GuiCommand>,
     _watcher: Option<NetChangeWatcher>,
 }
 
@@ -184,20 +182,14 @@ impl AppState {
         }
     }
 
-    fn open_or_focus_gui(&self) {
-        if focus_window_by_title(GUI_WINDOW_TITLE) {
-            return;
-        }
-        if let Err(e) = launch_gui_process() {
-            self.show_notification("打开配置界面失败", &e, true);
-        }
+    fn request_open_gui(&self) {
+        let _ = self.gui_tx.send(GuiCommand::OpenOrFocus);
     }
 
     fn start_apply_profile(&mut self, profile: NetworkProfile) {
         if self.is_switching() {
             return;
         }
-        // If switching to a profile belonging to another interface, update active interface too
         if !self
             .config
             .active_interface
@@ -230,7 +222,7 @@ impl AppState {
         if let Some(next) = pick_next_profile(&self.config, &self.status).cloned() {
             self.start_apply_profile(next);
         } else {
-            self.open_or_focus_gui();
+            self.request_open_gui();
         }
     }
 
@@ -240,10 +232,11 @@ impl AppState {
             Ok(new_status) => {
                 self.status = new_status;
                 self.update_tray_icon();
+                let _ = self.gui_tx.send(GuiCommand::Refresh);
                 let title = format!(
                     "已切换到「{}」({})",
                     res.profile.name,
-                    res.profile.mode.short_label()
+                    res.profile.short_mode_summary()
                 );
                 let body = format!(
                     "网卡: {}\n{}",
@@ -255,65 +248,9 @@ impl AppState {
             Err(err) => {
                 self.status = query_status(&self.config);
                 self.update_tray_icon();
+                let _ = self.gui_tx.send(GuiCommand::Refresh);
                 let title = format!("切换到「{}」失败", res.profile.name);
                 self.show_notification(&title, &err, true);
-            }
-        }
-    }
-
-    fn start_toggle_ipv6(&mut self) {
-        if self.is_switching() {
-            return;
-        }
-        self.status = query_status(&self.config);
-        let enable = !self.status.ipv6_enabled;
-        let iface = self.config.active_interface.clone();
-        let all_profiles = self.config.profiles.clone();
-        self.switching_to = Some(if enable {
-            "开启 IPv6".to_string()
-        } else {
-            "关闭 IPv6".to_string()
-        });
-        self.update_tray_icon();
-
-        let hwnd_raw = self.hwnd as isize;
-        thread::spawn(move || {
-            let outcome = set_interface_ipv6(&iface, enable, &all_profiles);
-            let boxed = Box::new(Ipv6Result { enable, outcome });
-            let ptr = Box::into_raw(boxed) as LPARAM;
-            unsafe {
-                PostMessageW(hwnd_raw as HWND, WM_APP_IPV6_DONE, 0, ptr);
-            }
-        });
-    }
-
-    fn handle_ipv6_done(&mut self, res: Ipv6Result) {
-        self.switching_to = None;
-        match res.outcome {
-            Ok(new_status) => {
-                self.status = new_status;
-                self.update_tray_icon();
-                let title = if res.enable {
-                    "已开启 IPv6"
-                } else {
-                    "已关闭 IPv6"
-                };
-                let body = format!(
-                    "网卡: {}\n{}",
-                    self.status.interface_name,
-                    self.status.summary_line()
-                );
-                self.show_notification(title, &body, false);
-            }
-            Err(err) => {
-                self.status = query_status(&self.config);
-                self.update_tray_icon();
-                let title = if res.enable {
-                    "开启 IPv6 失败"
-                } else {
-                    "关闭 IPv6 失败"
-                };
-                self.show_notification(title, &err, true);
             }
         }
     }
@@ -385,28 +322,27 @@ impl AppState {
                     self.status.display_label()
                 )
             };
-            let ip_gw = format!(
-                "IP: {}   网关: {}",
-                self.status.ipv4.as_deref().unwrap_or("-"),
-                self.status.gateway.as_deref().unwrap_or("-")
-            );
-            let dns_line = format!(
-                "DNS: {}   IPv6: {}",
-                if self.status.dns.is_empty() {
-                    "-".to_string()
-                } else {
-                    self.status.dns.join(", ")
-                },
-                if self.status.ipv6_enabled {
-                    "开启"
-                } else {
-                    "关闭"
-                }
-            );
+            let v4_line = if !self.status.ipv4_enabled {
+                "IPv4: 已关闭".to_string()
+            } else {
+                format!(
+                    "IPv4: {}   网关: {}",
+                    self.status.ipv4.as_deref().unwrap_or("-"),
+                    self.status.gateway.as_deref().unwrap_or("-")
+                )
+            };
+            let v6_line = if !self.status.ipv6_enabled {
+                "IPv6: 已关闭".to_string()
+            } else {
+                format!(
+                    "IPv6: {}",
+                    self.status.ipv6.as_deref().unwrap_or("已开启")
+                )
+            };
 
             append_item(menu, MF_STRING | MF_GRAYED, 0, &header);
-            append_item(menu, MF_STRING | MF_GRAYED, 0, &ip_gw);
-            append_item(menu, MF_STRING | MF_GRAYED, 0, &dns_line);
+            append_item(menu, MF_STRING | MF_GRAYED, 0, &v4_line);
+            append_item(menu, MF_STRING | MF_GRAYED, 0, &v6_line);
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
             let switch_flags = if self.is_switching() {
@@ -419,14 +355,17 @@ impl AppState {
                 let cycle_label = if let Some(ref target) = self.switching_to {
                     format!("正在切换到「{}」...", target)
                 } else {
-                    format!("一键切换 → {} ({})", next.name, next.mode.short_label())
+                    format!(
+                        "一键切换 → {} ({})",
+                        next.name,
+                        next.short_mode_summary()
+                    )
                 };
                 append_item(menu, switch_flags, CMD_CYCLE_NEXT as usize, &cycle_label);
                 SetMenuDefaultItem(menu, CMD_CYCLE_NEXT, 0);
                 AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             }
 
-            // Profiles for active interface
             let mut has_active_profiles = false;
             for (idx, p) in self.config.profiles.iter().enumerate() {
                 if !p
@@ -438,7 +377,7 @@ impl AppState {
                 has_active_profiles = true;
                 let checked = self.status.matched_profile_id.as_deref() == Some(p.id.as_str());
                 let flags = switch_flags | if checked { MF_CHECKED } else { 0 };
-                let label = format!("{}  [{}]", p.name, p.mode.short_label());
+                let label = format!("{}  [{}]", p.name, p.short_mode_summary());
                 append_item(menu, flags, (CMD_PROFILE_BASE as usize) + idx, &label);
             }
             if !has_active_profiles {
@@ -446,11 +385,10 @@ impl AppState {
                     menu,
                     MF_STRING | MF_GRAYED,
                     0,
-                    "当前网卡暂无 Profile（请点击下方打开配置界面）",
+                    "当前网卡暂无 Profile（请打开配置界面新建）",
                 );
             }
 
-            // Profiles bound to other interfaces (if any)
             let mut other_started = false;
             for (idx, p) in self.config.profiles.iter().enumerate() {
                 if p.interface_name
@@ -467,24 +405,10 @@ impl AppState {
                     "[{}] {}  ({})",
                     p.interface_name,
                     p.name,
-                    p.mode.short_label()
+                    p.short_mode_summary()
                 );
                 append_item(menu, switch_flags, (CMD_PROFILE_BASE as usize) + idx, &label);
             }
-
-            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-            let ipv6_flags = switch_flags
-                | if self.status.ipv6_enabled {
-                    MF_CHECKED
-                } else {
-                    0
-                };
-            append_item(
-                menu,
-                ipv6_flags,
-                CMD_TOGGLE_IPV6 as usize,
-                &format!("启用 IPv6 ({})", self.config.active_interface),
-            );
 
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             append_item(
@@ -543,7 +467,7 @@ impl AppState {
 
             match cmd {
                 CMD_CYCLE_NEXT => self.cycle_next_profile(),
-                CMD_OPEN_GUI => self.open_or_focus_gui(),
+                CMD_OPEN_GUI => self.request_open_gui(),
                 CMD_REFRESH => self.refresh_status(),
                 CMD_OPEN_CONFIG => {
                     if let Err(e) = open_file_in_shell(&self.config_path) {
@@ -551,7 +475,6 @@ impl AppState {
                     }
                 }
                 CMD_RELOAD_CONFIG => self.reload_config(true),
-                CMD_TOGGLE_IPV6 => self.start_toggle_ipv6(),
                 CMD_TOGGLE_AUTOSTART => self.toggle_autostart(),
                 CMD_EXIT => {
                     DestroyWindow(self.hwnd);
@@ -569,7 +492,24 @@ unsafe fn append_item(menu: *mut std::ffi::c_void, flags: u32, id: usize, text: 
     }
 }
 
-pub fn run(config: Config, config_path: PathBuf, open_gui_on_start: bool) -> Result<(), String> {
+pub fn spawn_tray_thread(
+    config: Config,
+    config_path: PathBuf,
+    gui_tx: Sender<GuiCommand>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        if let Err(e) = run_tray_loop(config, config_path, gui_tx.clone()) {
+            crate::winutil::show_error_box("Net Switcher 托盘错误", &e);
+            let _ = gui_tx.send(GuiCommand::Quit);
+        }
+    })
+}
+
+fn run_tray_loop(
+    config: Config,
+    config_path: PathBuf,
+    gui_tx: Sender<GuiCommand>,
+) -> Result<(), String> {
     let class_name = to_wide_null(TRAY_WINDOW_CLASS);
     let window_title = to_wide_null("NetSwitcher");
     let taskbar_created_w = to_wide_null("TaskbarCreated");
@@ -589,9 +529,7 @@ pub fn run(config: Config, config_path: PathBuf, open_gui_on_start: bool) -> Res
             lpszClassName: class_name.as_ptr(),
         };
 
-        if RegisterClassW(&wc) == 0 {
-            return Err("注册隐藏窗口类失败".to_string());
-        }
+        RegisterClassW(&wc);
 
         let hwnd = CreateWindowExW(
             0,
@@ -611,6 +549,9 @@ pub fn run(config: Config, config_path: PathBuf, open_gui_on_start: bool) -> Res
             return Err("创建托盘消息窗口失败".to_string());
         }
 
+        // Allow non-elevated duplicate launches to wake up our elevated single instance
+        allow_uipi_message(hwnd, WM_APP_OPEN_GUI);
+
         let taskbar_created_msg = RegisterWindowMessageW(taskbar_created_w.as_ptr());
         let initial_status = query_status(&config);
         let watcher = NetChangeWatcher::start(hwnd, WM_APP_NET_CHANGED);
@@ -624,15 +565,12 @@ pub fn run(config: Config, config_path: PathBuf, open_gui_on_start: bool) -> Res
             current_visual: None,
             current_icon: None,
             taskbar_created_msg,
+            gui_tx,
             _watcher: watcher,
         });
 
         state.add_tray_icon()?;
         state.reset_poll_timer();
-
-        if open_gui_on_start {
-            state.open_or_focus_gui();
-        }
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
@@ -670,7 +608,7 @@ unsafe extern "system" fn wnd_proc(
                         if state.config.ui.left_click_toggle {
                             state.cycle_next_profile();
                         } else {
-                            state.open_or_focus_gui();
+                            state.request_open_gui();
                         }
                     }
                     WM_RBUTTONUP | WM_CONTEXTMENU => {
@@ -694,19 +632,12 @@ unsafe extern "system" fn wnd_proc(
                 }
                 return 0;
             }
-            WM_APP_IPV6_DONE => {
-                if lparam != 0 {
-                    let res = unsafe { Box::from_raw(lparam as *mut Ipv6Result) };
-                    state.handle_ipv6_done(*res);
-                }
-                return 0;
-            }
             WM_APP_RELOAD_CONFIG => {
                 state.reload_config(false);
                 return 0;
             }
             WM_APP_OPEN_GUI => {
-                state.open_or_focus_gui();
+                state.request_open_gui();
                 return 0;
             }
             WM_TIMER => {
@@ -728,6 +659,7 @@ unsafe extern "system" fn wnd_proc(
                     KillTimer(hwnd, TIMER_DEBOUNCE_ID);
                 }
                 state.remove_tray_icon();
+                let _ = state.gui_tx.send(GuiCommand::Quit);
                 unsafe {
                     PostQuitMessage(0);
                 }

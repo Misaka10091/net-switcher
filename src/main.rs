@@ -8,24 +8,20 @@ mod net;
 mod tray;
 mod winutil;
 
+use std::sync::mpsc;
+
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
-const TRAY_MUTEX_NAME: &str = "Local\\NetSwitcher_SingleInstance_Mutex";
-const GUI_MUTEX_NAME: &str = "Local\\NetSwitcher_Gui_Mutex";
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\NetSwitcher_SingleInstance_Mutex";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--status" || a == "-s") {
         run_cli_status();
-        return;
-    }
-
-    if args.iter().any(|a| a == "--gui" || a == "-g") {
-        run_gui_mode();
         return;
     }
 
@@ -36,12 +32,15 @@ fn main() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let lock = match winutil::acquire_single_instance(TRAY_MUTEX_NAME) {
+    // Strict single-process mutual exclusion across both normal and elevated launches
+    let lock = match winutil::acquire_single_instance(SINGLE_INSTANCE_MUTEX) {
         Ok(winutil::InstanceLock::Acquired(guard)) => guard,
         Ok(winutil::InstanceLock::AlreadyRunning) => {
-            // If already running in tray, opening the exe again pops up / focuses the GPUI config window
-            if !start_minimized && !winutil::notify_tray_message(tray::TRAY_WINDOW_CLASS, tray::WM_APP_OPEN_GUI) {
-                let _ = winutil::launch_gui_process();
+            if !start_minimized {
+                let _ = winutil::notify_tray_message(
+                    tray::TRAY_WINDOW_CLASS,
+                    tray::WM_APP_OPEN_GUI,
+                );
             }
             return;
         }
@@ -52,7 +51,7 @@ fn main() {
     };
 
     if !no_elevate && !winutil::is_elevated() {
-        // Release mutex before spawning elevated instance so it can acquire cleanly
+        // Release mutex before spawning elevated single instance
         drop(lock);
         let _ = winutil::relaunch_as_admin();
         return;
@@ -61,16 +60,17 @@ fn main() {
     let config_path = config::resolve_config_path();
     let cfg = load_or_default_config(&config_path);
 
-    // Pop up GPUI config window on startup unless launched with --minimized (e.g. Windows autostart)
-    let open_gui_on_start = !start_minimized;
-    if let Err(e) = tray::run(cfg, config_path, open_gui_on_start) {
-        winutil::show_error_box("Net Switcher 运行错误", &e);
-    }
+    let (gui_tx, gui_rx) = mpsc::channel();
+    let tray_handle = tray::spawn_tray_thread(cfg, config_path.clone(), gui_tx);
 
+    // Main thread runs GPUI event loop; closing the config window keeps this single process resident in tray
+    gui::run_app(config_path, gui_rx, !start_minimized);
+
+    let _ = tray_handle.join();
     drop(lock);
 }
 
-fn load_or_default_config(config_path: &std::path::Path) -> config::Config {
+pub fn load_or_default_config(config_path: &std::path::Path) -> config::Config {
     if config_path.exists() {
         match config::load_config(config_path) {
             Ok(c) => return c,
@@ -91,28 +91,6 @@ fn load_or_default_config(config_path: &std::path::Path) -> config::Config {
     config::Config::default_for_interface(first_adapter)
 }
 
-fn run_gui_mode() {
-    unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
-
-    let _gui_lock = match winutil::acquire_single_instance(GUI_MUTEX_NAME) {
-        Ok(winutil::InstanceLock::Acquired(guard)) => guard,
-        Ok(winutil::InstanceLock::AlreadyRunning) => {
-            let _ = winutil::focus_window_by_title(gui::GUI_WINDOW_TITLE);
-            return;
-        }
-        Err(e) => {
-            winutil::show_error_box("Net Switcher GUI 启动失败", &e);
-            return;
-        }
-    };
-
-    let config_path = config::resolve_config_path();
-    let cfg = load_or_default_config(&config_path);
-    gui::run(cfg, config_path);
-}
-
 fn run_cli_status() {
     unsafe {
         AttachConsole(ATTACH_PARENT_PROCESS);
@@ -126,18 +104,32 @@ fn run_cli_status() {
                 "Interface   : {} (found={}, up={})",
                 st.interface_name, st.found, st.is_up
             );
-            println!("Active Mode : {}", st.display_label());
-            println!("DHCP Enabled: {}", st.dhcp_enabled);
-            println!("IPv6 Enabled: {}", st.ipv6_enabled);
-            println!("IPv4        : {}", st.ipv4.as_deref().unwrap_or("-"));
-            println!("Subnet Mask : {}", st.subnet_mask.as_deref().unwrap_or("-"));
-            println!("Gateway     : {}", st.gateway.as_deref().unwrap_or("-"));
+            println!("Active      : {}", st.display_label());
             println!(
-                "DNS         : {}",
+                "IPv4        : enabled={}, dhcp={}, ip={}, mask={}, gw={}, dns={}",
+                st.ipv4_enabled,
+                st.dhcp_enabled,
+                st.ipv4.as_deref().unwrap_or("-"),
+                st.subnet_mask.as_deref().unwrap_or("-"),
+                st.gateway.as_deref().unwrap_or("-"),
                 if st.dns.is_empty() {
                     "-".to_string()
                 } else {
                     st.dns.join(", ")
+                }
+            );
+            println!(
+                "IPv6        : enabled={}, ip={}, prefix={}, gw={}, dns={}",
+                st.ipv6_enabled,
+                st.ipv6.as_deref().unwrap_or("-"),
+                st.ipv6_prefix
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                st.ipv6_gateway.as_deref().unwrap_or("-"),
+                if st.ipv6_dns.is_empty() {
+                    "-".to_string()
+                } else {
+                    st.ipv6_dns.join(", ")
                 }
             );
             println!(
@@ -153,11 +145,11 @@ fn run_cli_status() {
                     " "
                 };
                 println!(
-                    "  [{}] {} ({}) - {}",
+                    "  [{}] {} [{}] - {}",
                     mark,
                     p.name,
-                    p.mode.short_label(),
-                    p.mode.summary()
+                    p.short_mode_summary(),
+                    p.detail_summary()
                 );
             }
             println!("Elevated    : {}", winutil::is_elevated());

@@ -1,23 +1,27 @@
 mod text_input;
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, mpsc::Receiver};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, FocusHandle, Focusable, KeyBinding,
-    MouseButton, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, rgb, size,
+    AnyElement, App, Application, AsyncApp, Bounds, Context, Entity, FocusHandle, Focusable,
+    KeyBinding, MouseButton, SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 use crate::config::{
-    Config, Ipv6Setting, NetworkProfile, ProfileMode, load_config, save_config, validate_config,
+    Config, Ipv4Config, Ipv6Config, NetworkProfile, load_config, save_config, validate_config,
     validate_profile,
 };
+use crate::load_or_default_config;
 use crate::net::{
     AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters, pick_next_profile,
-    query_interface_status, set_interface_ipv6,
+    query_interface_status,
 };
-use crate::tray::{TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG};
-use crate::winutil::{is_elevated, notify_tray_message};
+use crate::tray::{GuiCommand, TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG};
+use crate::winutil::{focus_window_by_title, is_elevated, notify_tray_message};
 
 use text_input::{TextInput, bind_text_input_keys};
 
@@ -25,11 +29,41 @@ pub const GUI_WINDOW_TITLE: &str = "Net Switcher — 网卡与 Profile 配置";
 
 actions!(net_gui, [CloseWindow]);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ipv4Kind {
+    Static,
+    Dhcp,
+    Disabled,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ipv6Kind {
+    Dhcp,
+    Static,
+    Disabled,
+}
+
 #[derive(Clone)]
 enum Banner {
     Info(SharedString),
     Success(SharedString),
     Error(SharedString),
+}
+
+struct EditorFields {
+    name: String,
+    v4_kind: Ipv4Kind,
+    v4_renew: bool,
+    v4_ip: String,
+    v4_mask: String,
+    v4_gateway: String,
+    v4_metric: String,
+    v4_dns: String,
+    v6_kind: Ipv6Kind,
+    v6_ip: String,
+    v6_prefix: String,
+    v6_gateway: String,
+    v6_dns: String,
 }
 
 struct ConfigWindow {
@@ -44,18 +78,23 @@ struct ConfigWindow {
     switching_profile_name: Option<String>,
     banner: Option<Banner>,
 
-    // Profile editor inputs
+    // Profile editor state
     name_input: Entity<TextInput>,
-    editor_is_dhcp: bool,
-    editor_renew_on_switch: bool,
-    editor_ipv6: Ipv6Setting,
-    ip_input: Entity<TextInput>,
-    mask_input: Entity<TextInput>,
-    gateway_input: Entity<TextInput>,
-    metric_input: Entity<TextInput>,
-    dns_input: Entity<TextInput>,
+    v4_kind: Ipv4Kind,
+    v4_renew: bool,
+    v4_ip_input: Entity<TextInput>,
+    v4_mask_input: Entity<TextInput>,
+    v4_gateway_input: Entity<TextInput>,
+    v4_metric_input: Entity<TextInput>,
+    v4_dns_input: Entity<TextInput>,
 
-    // Global UI settings inputs
+    v6_kind: Ipv6Kind,
+    v6_ip_input: Entity<TextInput>,
+    v6_prefix_input: Entity<TextInput>,
+    v6_gateway_input: Entity<TextInput>,
+    v6_dns_input: Entity<TextInput>,
+
+    // Global UI settings
     interval_input: Entity<TextInput>,
     show_notifications: bool,
     left_click_toggle: bool,
@@ -76,36 +115,30 @@ impl ConfigWindow {
         let initial_profile_id = current_status
             .matched_profile_id
             .clone()
-            .or_else(|| {
-                config
-                    .active_profiles()
-                    .first()
-                    .map(|p| p.id.clone())
-            });
+            .or_else(|| config.active_profiles().first().map(|p| p.id.clone()));
 
         let initial_profile = initial_profile_id
             .as_deref()
             .and_then(|id| config.profiles.iter().find(|p| p.id == id))
             .cloned();
 
-        let (
-            init_name,
-            init_is_dhcp,
-            init_renew,
-            init_ipv6,
-            init_ip,
-            init_mask,
-            init_gw,
-            init_metric,
-            init_dns,
-        ) = extract_profile_editor_fields(initial_profile.as_ref());
+        let fields = extract_editor_fields(initial_profile.as_ref());
 
-        let name_input = cx.new(|cx| TextInput::new(cx, init_name, "如 旁路由固定网关 / DHCP 自动"));
-        let ip_input = cx.new(|cx| TextInput::new(cx, init_ip, "如 192.168.1.100"));
-        let mask_input = cx.new(|cx| TextInput::new(cx, init_mask, "如 255.255.255.0"));
-        let gateway_input = cx.new(|cx| TextInput::new(cx, init_gw, "如 192.168.1.2"));
-        let metric_input = cx.new(|cx| TextInput::new(cx, init_metric, "0 表示自动跃点"));
-        let dns_input = cx.new(|cx| TextInput::new(cx, init_dns, "如 192.168.1.1, 223.5.5.5"));
+        let name_input = cx.new(|cx| TextInput::new(cx, fields.name, "如 旁路由固定网关 / DHCP"));
+        let v4_ip_input = cx.new(|cx| TextInput::new(cx, fields.v4_ip, "如 192.168.1.100"));
+        let v4_mask_input = cx.new(|cx| TextInput::new(cx, fields.v4_mask, "如 255.255.255.0"));
+        let v4_gateway_input = cx.new(|cx| TextInput::new(cx, fields.v4_gateway, "如 192.168.1.2"));
+        let v4_metric_input = cx.new(|cx| TextInput::new(cx, fields.v4_metric, "0 表示自动跃点"));
+        let v4_dns_input =
+            cx.new(|cx| TextInput::new(cx, fields.v4_dns, "如 192.168.1.1, 223.5.5.5"));
+
+        let v6_ip_input = cx.new(|cx| TextInput::new(cx, fields.v6_ip, "如 fd00::100"));
+        let v6_prefix_input = cx.new(|cx| TextInput::new(cx, fields.v6_prefix, "默认 64"));
+        let v6_gateway_input =
+            cx.new(|cx| TextInput::new(cx, fields.v6_gateway, "可选，如 fd00::1"));
+        let v6_dns_input =
+            cx.new(|cx| TextInput::new(cx, fields.v6_dns, "可选，如 2400:3200::1"));
+
         let interval_input = cx.new(|cx| {
             TextInput::new(cx, config.ui.refresh_interval_seconds.to_string(), "默认 15")
         });
@@ -125,18 +158,31 @@ impl ConfigWindow {
             switching_profile_name: None,
             banner: None,
             name_input,
-            editor_is_dhcp: init_is_dhcp,
-            editor_renew_on_switch: init_renew,
-            editor_ipv6: init_ipv6,
-            ip_input,
-            mask_input,
-            gateway_input,
-            metric_input,
-            dns_input,
+            v4_kind: fields.v4_kind,
+            v4_renew: fields.v4_renew,
+            v4_ip_input,
+            v4_mask_input,
+            v4_gateway_input,
+            v4_metric_input,
+            v4_dns_input,
+            v6_kind: fields.v6_kind,
+            v6_ip_input,
+            v6_prefix_input,
+            v6_gateway_input,
+            v6_dns_input,
             interval_input,
             show_notifications,
             left_click_toggle,
         }
+    }
+
+    fn refresh_live_only(&mut self, cx: &mut Context<Self>) {
+        self.adapters = list_adapters();
+        self.current_status = query_interface_status(
+            &self.draft_config.active_interface,
+            &self.draft_config.profiles,
+        );
+        cx.notify();
     }
 
     fn sync_editor_into_draft(&mut self, cx: &App) -> Result<(), String> {
@@ -160,40 +206,70 @@ impl ConfigWindow {
         };
 
         profile.name = self.name_input.read(cx).text().trim().to_string();
-        profile.ipv6 = self.editor_ipv6;
 
-        if self.editor_is_dhcp {
-            profile.mode = ProfileMode::Dhcp {
-                renew_on_switch: self.editor_renew_on_switch,
-            };
-        } else {
-            let ip = self.ip_input.read(cx).text().trim().to_string();
-            let subnet_mask = self.mask_input.read(cx).text().trim().to_string();
-            let gateway = self.gateway_input.read(cx).text().trim().to_string();
-            let metric_str = self.metric_input.read(cx).text().trim().to_string();
-            let gateway_metric = if metric_str.is_empty() {
-                0
-            } else {
-                metric_str
-                    .parse::<u32>()
-                    .map_err(|_| format!("网关跃点数必须是非负整数: {}", metric_str))?
-            };
-            let dns_raw = self.dns_input.read(cx).text();
-            let dns: Vec<String> = dns_raw
-                .split([',', ';', '，', ' '])
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
+        profile.ipv4 = match self.v4_kind {
+            Ipv4Kind::Dhcp => Ipv4Config::Dhcp {
+                renew_on_switch: self.v4_renew,
+            },
+            Ipv4Kind::Disabled => Ipv4Config::Disabled,
+            Ipv4Kind::Static => {
+                let ip = self.v4_ip_input.read(cx).text().trim().to_string();
+                let subnet_mask = self.v4_mask_input.read(cx).text().trim().to_string();
+                let gateway = self.v4_gateway_input.read(cx).text().trim().to_string();
+                let metric_str = self.v4_metric_input.read(cx).text().trim().to_string();
+                let gateway_metric = if metric_str.is_empty() {
+                    0
+                } else {
+                    metric_str
+                        .parse::<u32>()
+                        .map_err(|_| format!("IPv4 网关跃点数必须是非负整数: {}", metric_str))?
+                };
+                let dns_raw = self.v4_dns_input.read(cx).text();
+                let dns: Vec<String> = dns_raw
+                    .split([',', ';', '，', ' '])
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                Ipv4Config::Static {
+                    ip,
+                    subnet_mask,
+                    gateway,
+                    gateway_metric,
+                    dns,
+                }
+            }
+        };
 
-            profile.mode = ProfileMode::Static {
-                ip,
-                subnet_mask,
-                gateway,
-                gateway_metric,
-                dns,
-            };
-        }
+        profile.ipv6 = match self.v6_kind {
+            Ipv6Kind::Dhcp => Ipv6Config::Dhcp,
+            Ipv6Kind::Disabled => Ipv6Config::Disabled,
+            Ipv6Kind::Static => {
+                let ip = self.v6_ip_input.read(cx).text().trim().to_string();
+                let prefix_str = self.v6_prefix_input.read(cx).text().trim().to_string();
+                let prefix_length = if prefix_str.is_empty() {
+                    64
+                } else {
+                    prefix_str
+                        .parse::<u8>()
+                        .map_err(|_| format!("IPv6 前缀长度必须是 1~128 的整数: {}", prefix_str))?
+                };
+                let gateway = self.v6_gateway_input.read(cx).text().trim().to_string();
+                let dns_raw = self.v6_dns_input.read(cx).text();
+                let dns: Vec<String> = dns_raw
+                    .split([',', ';', '，', ' '])
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+                Ipv6Config::Static {
+                    ip,
+                    prefix_length,
+                    gateway,
+                    dns,
+                }
+            }
+        };
 
         Ok(())
     }
@@ -205,18 +281,31 @@ impl ConfigWindow {
             .and_then(|id| self.draft_config.profiles.iter().find(|p| p.id == id))
             .cloned();
 
-        let (name, is_dhcp, renew, ipv6, ip, mask, gw, metric, dns) =
-            extract_profile_editor_fields(profile.as_ref());
+        let fields = extract_editor_fields(profile.as_ref());
+        self.v4_kind = fields.v4_kind;
+        self.v4_renew = fields.v4_renew;
+        self.v6_kind = fields.v6_kind;
 
-        self.editor_is_dhcp = is_dhcp;
-        self.editor_renew_on_switch = renew;
-        self.editor_ipv6 = ipv6;
-        self.name_input.update(cx, |i, cx| i.set_text(name, cx));
-        self.ip_input.update(cx, |i, cx| i.set_text(ip, cx));
-        self.mask_input.update(cx, |i, cx| i.set_text(mask, cx));
-        self.gateway_input.update(cx, |i, cx| i.set_text(gw, cx));
-        self.metric_input.update(cx, |i, cx| i.set_text(metric, cx));
-        self.dns_input.update(cx, |i, cx| i.set_text(dns, cx));
+        self.name_input.update(cx, |i, cx| i.set_text(fields.name, cx));
+        self.v4_ip_input
+            .update(cx, |i, cx| i.set_text(fields.v4_ip, cx));
+        self.v4_mask_input
+            .update(cx, |i, cx| i.set_text(fields.v4_mask, cx));
+        self.v4_gateway_input
+            .update(cx, |i, cx| i.set_text(fields.v4_gateway, cx));
+        self.v4_metric_input
+            .update(cx, |i, cx| i.set_text(fields.v4_metric, cx));
+        self.v4_dns_input
+            .update(cx, |i, cx| i.set_text(fields.v4_dns, cx));
+
+        self.v6_ip_input
+            .update(cx, |i, cx| i.set_text(fields.v6_ip, cx));
+        self.v6_prefix_input
+            .update(cx, |i, cx| i.set_text(fields.v6_prefix, cx));
+        self.v6_gateway_input
+            .update(cx, |i, cx| i.set_text(fields.v6_gateway, cx));
+        self.v6_dns_input
+            .update(cx, |i, cx| i.set_text(fields.v6_dns, cx));
     }
 
     fn refresh_adapters(&mut self, cx: &mut Context<Self>) {
@@ -235,8 +324,7 @@ impl ConfigWindow {
     fn select_adapter(&mut self, name: String, cx: &mut Context<Self>) {
         let _ = self.sync_editor_into_draft(cx);
         self.draft_config.active_interface = name.clone();
-        self.current_status =
-            query_interface_status(&name, &self.draft_config.profiles);
+        self.current_status = query_interface_status(&name, &self.draft_config.profiles);
 
         self.selected_profile_id = self
             .current_status
@@ -268,12 +356,12 @@ impl ConfigWindow {
         cx.notify();
     }
 
-    fn add_profile(&mut self, is_dhcp: bool, cx: &mut Context<Self>) {
+    fn add_profile(&mut self, default_dhcp: bool, cx: &mut Context<Self>) {
         let _ = self.sync_editor_into_draft(cx);
         let iface = self.draft_config.active_interface.clone();
         let existing_count = self.draft_config.profiles_for_interface(&iface).len();
 
-        let (id, name, mode) = if is_dhcp {
+        let (id, name, ipv4, ipv6) = if default_dhcp {
             (
                 self.draft_config.next_profile_id("dhcp"),
                 if existing_count == 0 {
@@ -281,9 +369,10 @@ impl ConfigWindow {
                 } else {
                     format!("DHCP 自动 {}", existing_count + 1)
                 },
-                ProfileMode::Dhcp {
+                Ipv4Config::Dhcp {
                     renew_on_switch: true,
                 },
+                Ipv6Config::Dhcp,
             )
         } else {
             let adapter = self
@@ -306,13 +395,14 @@ impl ConfigWindow {
             (
                 self.draft_config.next_profile_id("static"),
                 format!("静态配置 {}", existing_count + 1),
-                ProfileMode::Static {
+                Ipv4Config::Static {
                     ip,
                     subnet_mask: mask,
                     gateway: gw,
                     gateway_metric: 0,
                     dns,
                 },
+                Ipv6Config::Disabled,
             )
         };
 
@@ -320,14 +410,14 @@ impl ConfigWindow {
             id: id.clone(),
             name: name.clone(),
             interface_name: iface,
-            mode,
-            ipv6: Ipv6Setting::Keep,
+            ipv4,
+            ipv6,
         };
         self.draft_config.profiles.push(profile);
         self.selected_profile_id = Some(id);
         self.load_selected_profile_into_editor(cx);
         self.banner = Some(Banner::Info(
-            format!("已新建 Profile「{}」，编辑完成后请点击保存", name).into(),
+            format!("已新建 Profile「{}」，可在右侧分别配置 IPv4 / IPv6 后保存或应用", name).into(),
         ));
         cx.notify();
     }
@@ -353,7 +443,7 @@ impl ConfigWindow {
             id: new_id.clone(),
             name: new_name.clone(),
             interface_name: orig.interface_name,
-            mode: orig.mode,
+            ipv4: orig.ipv4,
             ipv6: orig.ipv6,
         };
         self.draft_config.profiles.push(copy);
@@ -394,86 +484,25 @@ impl ConfigWindow {
         cx.notify();
     }
 
-    fn set_editor_mode(&mut self, is_dhcp: bool, cx: &mut Context<Self>) {
-        if self.editor_is_dhcp == is_dhcp {
+    fn set_v4_kind(&mut self, kind: Ipv4Kind, cx: &mut Context<Self>) {
+        if self.v4_kind == kind {
             return;
         }
-        self.editor_is_dhcp = is_dhcp;
+        self.v4_kind = kind;
         let _ = self.sync_editor_into_draft(cx);
         cx.notify();
     }
 
-    fn set_editor_ipv6(&mut self, setting: Ipv6Setting, cx: &mut Context<Self>) {
-        if self.editor_ipv6 == setting {
+    fn set_v6_kind(&mut self, kind: Ipv6Kind, cx: &mut Context<Self>) {
+        if self.v6_kind == kind {
             return;
         }
-        self.editor_ipv6 = setting;
+        self.v6_kind = kind;
         let _ = self.sync_editor_into_draft(cx);
         cx.notify();
     }
 
-    fn toggle_active_adapter_ipv6(&mut self, cx: &mut Context<Self>) {
-        if self.switching_profile_name.is_some() {
-            return;
-        }
-        if !self.is_admin {
-            self.banner = Some(Banner::Error(
-                "当前不是管理员权限，无法修改网卡 IPv6 开关；请以管理员身份运行或从托盘打开"
-                    .into(),
-            ));
-            cx.notify();
-            return;
-        }
-
-        let iface = self.draft_config.active_interface.clone();
-        let next_enable = !self.current_status.ipv6_enabled;
-        let all_profiles = self.draft_config.profiles.clone();
-        let action_label = if next_enable { "开启 IPv6" } else { "关闭 IPv6" };
-
-        self.switching_profile_name = Some(action_label.to_string());
-        self.banner = Some(Banner::Info(
-            format!("正在对网卡「{}」执行 {}...", iface, action_label).into(),
-        ));
-        cx.notify();
-
-        cx.spawn(async move |view, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { set_interface_ipv6(&iface, next_enable, &all_profiles) })
-                .await;
-
-            let _ = view.update(cx, |this, cx| {
-                this.switching_profile_name = None;
-                this.adapters = list_adapters();
-                match result {
-                    Ok(status) => {
-                        this.current_status = status;
-                        let _ = notify_tray_message(TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG);
-                        this.banner = Some(Banner::Success(
-                            format!(
-                                "网卡「{}」已{}（{}）",
-                                this.current_status.interface_name,
-                                action_label,
-                                this.current_status.summary_line()
-                            )
-                            .into(),
-                        ));
-                    }
-                    Err(err) => {
-                        this.current_status = query_interface_status(
-                            &this.draft_config.active_interface,
-                            &this.draft_config.profiles,
-                        );
-                        this.banner = Some(Banner::Error(err.into()));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn import_selected_adapter_info(&mut self, cx: &mut Context<Self>) {
+    fn import_current_ipv4(&mut self, cx: &mut Context<Self>) {
         let iface = &self.draft_config.active_interface;
         let Some(adapter) = self
             .adapters
@@ -486,23 +515,62 @@ impl ConfigWindow {
             return;
         };
 
-        self.editor_is_dhcp = false;
+        self.v4_kind = Ipv4Kind::Static;
         if let Some(ip) = adapter.ipv4 {
-            self.ip_input.update(cx, |i, cx| i.set_text(ip, cx));
+            self.v4_ip_input.update(cx, |i, cx| i.set_text(ip, cx));
         }
         if let Some(mask) = adapter.subnet_mask {
-            self.mask_input.update(cx, |i, cx| i.set_text(mask, cx));
+            self.v4_mask_input.update(cx, |i, cx| i.set_text(mask, cx));
         }
         if let Some(gw) = adapter.gateway {
-            self.gateway_input.update(cx, |i, cx| i.set_text(gw, cx));
+            self.v4_gateway_input.update(cx, |i, cx| i.set_text(gw, cx));
         }
         if !adapter.dns.is_empty() {
             let dns_str = adapter.dns.join(", ");
-            self.dns_input.update(cx, |i, cx| i.set_text(dns_str, cx));
+            self.v4_dns_input
+                .update(cx, |i, cx| i.set_text(dns_str, cx));
         }
         let _ = self.sync_editor_into_draft(cx);
         self.banner = Some(Banner::Info(
-            format!("已从 {} 导入当前 IP / 掩码 / 网关 / DNS", adapter.friendly_name).into(),
+            format!("已从 {} 导入当前 IPv4 参数（仅写入表单，未修改网卡）", adapter.friendly_name)
+                .into(),
+        ));
+        cx.notify();
+    }
+
+    fn import_current_ipv6(&mut self, cx: &mut Context<Self>) {
+        let iface = &self.draft_config.active_interface;
+        let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|a| a.friendly_name.eq_ignore_ascii_case(iface))
+            .cloned()
+        else {
+            self.banner = Some(Banner::Error("当前选中的网卡不在系统列表中".into()));
+            cx.notify();
+            return;
+        };
+
+        self.v6_kind = Ipv6Kind::Static;
+        if let Some(ip) = adapter.ipv6 {
+            self.v6_ip_input.update(cx, |i, cx| i.set_text(ip, cx));
+        }
+        if let Some(prefix) = adapter.ipv6_prefix {
+            self.v6_prefix_input
+                .update(cx, |i, cx| i.set_text(prefix.to_string(), cx));
+        }
+        if let Some(gw) = adapter.ipv6_gateway {
+            self.v6_gateway_input.update(cx, |i, cx| i.set_text(gw, cx));
+        }
+        if !adapter.ipv6_dns.is_empty() {
+            let dns_str = adapter.ipv6_dns.join(", ");
+            self.v6_dns_input
+                .update(cx, |i, cx| i.set_text(dns_str, cx));
+        }
+        let _ = self.sync_editor_into_draft(cx);
+        self.banner = Some(Banner::Info(
+            format!("已从 {} 导入当前 IPv6 参数（仅写入表单，未修改网卡）", adapter.friendly_name)
+                .into(),
         ));
         cx.notify();
     }
@@ -557,7 +625,8 @@ impl ConfigWindow {
                 );
                 let _ = notify_tray_message(TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG);
                 self.banner = Some(Banner::Success(
-                    "全部配置已保存至 config.json，并已同步到系统托盘".into(),
+                    "配置已保存至 config.json 并同步到托盘（尚未改动网卡，点击「切换」或「保存并应用」生效）"
+                        .into(),
                 ));
                 cx.notify();
                 Some(self.draft_config.clone())
@@ -599,7 +668,7 @@ impl ConfigWindow {
         }
         if !self.is_admin {
             self.banner = Some(Banner::Error(
-                "当前不是管理员权限，无法修改网卡配置；请以管理员身份运行或从托盘打开".into(),
+                "当前不是管理员权限，无法修改网卡配置；请以管理员身份运行".into(),
             ));
             cx.notify();
             return;
@@ -615,7 +684,6 @@ impl ConfigWindow {
             return;
         }
 
-        // Select the target profile so user can also see its details on the right
         if self.selected_profile_id.as_deref() != Some(target_id.as_str()) {
             self.selected_profile_id = Some(target_id.clone());
             self.load_selected_profile_into_editor(cx);
@@ -639,21 +707,20 @@ impl ConfigWindow {
             return;
         }
 
-        // Persist valid config silently if it has unsaved edits so tray stays in sync
-        if validate_config(&self.draft_config).is_ok() {
-            if save_config(&self.config_path, &self.draft_config).is_ok() {
-                self.saved_config = self.draft_config.clone();
-            }
+        if validate_config(&self.draft_config).is_ok()
+            && save_config(&self.config_path, &self.draft_config).is_ok()
+        {
+            self.saved_config = self.draft_config.clone();
         }
 
         let all_profiles = self.draft_config.profiles.clone();
         let target_name = profile.name.clone();
-        let target_mode_label = profile.mode.short_label();
+        let mode_summary = profile.short_mode_summary();
         self.switching_profile_name = Some(target_name.clone());
         self.banner = Some(Banner::Info(
             format!(
-                "正在将 {} 切换到「{}」({})...",
-                profile.interface_name, target_name, target_mode_label
+                "正在将 {} 切换到「{}」[{}]（统一应用 IPv4 与 IPv6 配置）...",
+                profile.interface_name, target_name, mode_summary
             )
             .into(),
         ));
@@ -700,7 +767,6 @@ impl ConfigWindow {
             .friendly_name
             .eq_ignore_ascii_case(&self.draft_config.active_interface);
         let name_for_click = adapter.friendly_name.clone();
-        let ip_text = adapter.ipv4.as_deref().unwrap_or("无 IP");
         let profile_count = self
             .draft_config
             .profiles_for_interface(&adapter.friendly_name)
@@ -711,6 +777,17 @@ impl ConfigWindow {
         } else {
             (rgb(0x64748b), "断开", rgb(0x334155))
         };
+
+        let v4_text = if !adapter.ipv4_enabled {
+            "v4关".to_string()
+        } else {
+            format!(
+                "{}({})",
+                adapter.ipv4.as_deref().unwrap_or("-"),
+                if adapter.dhcp_enabled { "DHCP" } else { "静态" }
+            )
+        };
+        let v6_text = if adapter.ipv6_enabled { "v6开" } else { "v6关" };
 
         div()
             .id(SharedString::from(format!("adapter-{}", adapter.friendly_name)))
@@ -787,12 +864,7 @@ impl ConfigWindow {
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0xcbd5e1))
-                    .child(format!(
-                        "{} · {} · IPv6{}",
-                        ip_text,
-                        if adapter.dhcp_enabled { "DHCP" } else { "静态" },
-                        if adapter.ipv6_enabled { "开" } else { "关" }
-                    )),
+                    .child(format!("{} · {}", v4_text, v6_text)),
             )
             .into_any_element()
     }
@@ -807,10 +879,15 @@ impl ConfigWindow {
         let id_for_select = profile.id.clone();
         let id_for_apply = profile.id.clone();
 
-        let (mode_label, mode_bg) = if profile.mode.is_dhcp() {
-            ("DHCP", rgb(0x065f46))
-        } else {
-            ("静态 IP", rgb(0x1d4ed8))
+        let v4_badge_bg = match profile.ipv4 {
+            Ipv4Config::Static { .. } => rgb(0x1d4ed8),
+            Ipv4Config::Dhcp { .. } => rgb(0x065f46),
+            Ipv4Config::Disabled => rgb(0x475569),
+        };
+        let v6_badge_bg = match profile.ipv6 {
+            Ipv6Config::Static { .. } => rgb(0x6d28d9),
+            Ipv6Config::Dhcp => rgb(0x0f766e),
+            Ipv6Config::Disabled => rgb(0x9a3412),
         };
 
         div()
@@ -853,45 +930,38 @@ impl ConfigWindow {
                             } else {
                                 profile.name.clone()
                             }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .bg(v4_badge_bg)
+                            .text_size(px(10.))
+                            .text_color(rgb(0xf8fafc))
+                            .child(profile.ipv4.short_label()),
                     )
                     .child(
                         div()
-                            .flex()
-                            .gap(px(4.))
-                            .when_some(profile.ipv6.short_badge(), |this, badge| {
-                                let badge_bg = match profile.ipv6 {
-                                    Ipv6Setting::Disable => rgb(0x9a3412),
-                                    Ipv6Setting::Enable => rgb(0x0f766e),
-                                    Ipv6Setting::Keep => rgb(0x334155),
-                                };
-                                this.child(
-                                    div()
-                                        .px(px(5.))
-                                        .py(px(1.))
-                                        .rounded(px(4.))
-                                        .bg(badge_bg)
-                                        .text_size(px(10.))
-                                        .text_color(rgb(0xf8fafc))
-                                        .child(badge),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .px(px(6.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
-                                    .bg(mode_bg)
-                                    .text_size(px(10.))
-                                    .text_color(rgb(0xf8fafc))
-                                    .child(mode_label),
-                            ),
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(4.))
+                            .bg(v6_badge_bg)
+                            .text_size(px(10.))
+                            .text_color(rgb(0xf8fafc))
+                            .child(profile.ipv6.short_label()),
                     ),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(rgb(0x94a3b8))
-                    .child(profile.mode.summary()),
+                    .child(profile.ipv4.summary()),
             )
             .child(
                 div()
@@ -978,11 +1048,11 @@ impl ConfigWindow {
         div()
             .flex()
             .flex_col()
-            .gap(px(5.))
+            .gap(px(4.))
             .flex_1()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .text_color(rgb(0x94a3b8))
                     .child(label.to_string()),
             )
@@ -1027,8 +1097,39 @@ impl ConfigWindow {
             .into_any_element()
     }
 
+    fn render_seg_btn(
+        id: &'static str,
+        label: &'static str,
+        active: bool,
+        active_bg: u32,
+        active_border: u32,
+        on_click: impl Fn(&mut Self, &gpui::MouseDownEvent, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex_1()
+            .py(px(6.))
+            .rounded(px(6.))
+            .text_center()
+            .text_size(px(12.))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(if active { rgb(active_bg) } else { rgb(0x0f172a) })
+            .border_1()
+            .border_color(if active {
+                rgb(active_border)
+            } else {
+                rgb(0x334155)
+            })
+            .text_color(rgb(0xf8fafc))
+            .on_mouse_down(MouseButton::Left, cx.listener(on_click))
+            .child(label)
+            .into_any_element()
+    }
+
     fn render_editor_card(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(_) = self.selected_profile_id.as_ref() else {
+        if self.selected_profile_id.is_none() {
             return div()
                 .flex()
                 .flex_col()
@@ -1068,7 +1169,7 @@ impl ConfigWindow {
                                     MouseButton::Left,
                                     cx.listener(|this, _, _, cx| this.add_profile(false, cx)),
                                 )
-                                .child("+ 新建静态 IP Profile"),
+                                .child("+ 新建静态 Profile"),
                         )
                         .child(
                             div()
@@ -1089,92 +1190,219 @@ impl ConfigWindow {
                         ),
                 )
                 .into_any_element();
-        };
+        }
 
-        let mode_section: AnyElement = if self.editor_is_dhcp {
-            div()
+        // IPv4 segmented buttons + detail form
+        let v4_btn_static = Self::render_seg_btn(
+            "v4-mode-static",
+            "静态 IP",
+            self.v4_kind == Ipv4Kind::Static,
+            0x2563eb,
+            0x60a5fa,
+            |this, _, _, cx| this.set_v4_kind(Ipv4Kind::Static, cx),
+            cx,
+        );
+        let v4_btn_dhcp = Self::render_seg_btn(
+            "v4-mode-dhcp",
+            "DHCP 自动",
+            self.v4_kind == Ipv4Kind::Dhcp,
+            0x059669,
+            0x34d399,
+            |this, _, _, cx| this.set_v4_kind(Ipv4Kind::Dhcp, cx),
+            cx,
+        );
+        let v4_btn_disabled = Self::render_seg_btn(
+            "v4-mode-disabled",
+            "关闭 IPv4",
+            self.v4_kind == Ipv4Kind::Disabled,
+            0xc2410c,
+            0xfb923c,
+            |this, _, _, cx| this.set_v4_kind(Ipv4Kind::Disabled, cx),
+            cx,
+        );
+
+        let v4_detail: AnyElement = match self.v4_kind {
+            Ipv4Kind::Static => div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
-                .p(px(12.))
-                .rounded(px(8.))
-                .bg(rgb(0x0f172a))
-                .border_1()
-                .border_color(rgb(0x1e293b))
+                .gap(px(8.))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .flex()
+                        .gap(px(10.))
+                        .child(Self::render_field("IPv4 地址", self.v4_ip_input.clone()))
+                        .child(Self::render_field("子网掩码", self.v4_mask_input.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(Self::render_field(
+                            "默认网关 (如旁路由)",
+                            self.v4_gateway_input.clone(),
+                        ))
+                        .child(Self::render_field(
+                            "跃点数 (0=自动)",
+                            self.v4_metric_input.clone(),
+                        )),
+                )
+                .child(Self::render_field(
+                    "IPv4 DNS（多条用英文逗号分隔）",
+                    self.v4_dns_input.clone(),
+                ))
+                .child(
+                    div().flex().justify_end().child(
+                        div()
+                            .id("btn-import-v4")
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .bg(rgb(0x1e293b))
+                            .border_1()
+                            .border_color(rgb(0x334155))
+                            .text_size(px(11.))
+                            .text_color(rgb(0x93c5fd))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x334155)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.import_current_ipv4(cx)),
+                            )
+                            .child("导入当前网卡 IPv4"),
+                    ),
+                )
+                .into_any_element(),
+            Ipv4Kind::Dhcp => div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .p(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(0x0b1220))
+                .child(
+                    div()
+                        .text_size(px(11.))
                         .text_color(rgb(0x94a3b8))
-                        .child("DHCP 模式会将所选网卡的 IPv4 地址、默认网关和 DNS 服务器全部设为自动获取。"),
+                        .child("应用此 Profile 时，将 IPv4 地址、网关与 DNS 设为自动获取。"),
                 )
                 .child(Self::render_toggle_row(
-                    "toggle-profile-renew",
-                    "切换后自动执行租约刷新 (ipconfig /renew)",
-                    self.editor_renew_on_switch,
+                    "toggle-v4-renew",
+                    "切换后自动刷新租约 (ipconfig /renew)",
+                    self.v4_renew,
                     |this, _, _, cx| {
-                        this.editor_renew_on_switch = !this.editor_renew_on_switch;
+                        this.v4_renew = !this.v4_renew;
                         let _ = this.sync_editor_into_draft(cx);
                         cx.notify();
                     },
                     cx,
                 ))
-                .into_any_element()
-        } else {
-            div()
+                .into_any_element(),
+            Ipv4Kind::Disabled => div()
+                .p(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(0x0b1220))
+                .text_size(px(11.))
+                .text_color(rgb(0xfdba74))
+                .child("应用此 Profile 时，将禁用该网卡的 TCP/IPv4 绑定 (ms_tcpip)。仅在点击「切换 / 应用」时生效。")
+                .into_any_element(),
+        };
+
+        // IPv6 segmented buttons + detail form
+        let v6_btn_dhcp = Self::render_seg_btn(
+            "v6-mode-dhcp",
+            "DHCP / 自动",
+            self.v6_kind == Ipv6Kind::Dhcp,
+            0x0f766e,
+            0x2dd4bf,
+            |this, _, _, cx| this.set_v6_kind(Ipv6Kind::Dhcp, cx),
+            cx,
+        );
+        let v6_btn_static = Self::render_seg_btn(
+            "v6-mode-static",
+            "静态 IPv6",
+            self.v6_kind == Ipv6Kind::Static,
+            0x6d28d9,
+            0xa78bfa,
+            |this, _, _, cx| this.set_v6_kind(Ipv6Kind::Static, cx),
+            cx,
+        );
+        let v6_btn_disabled = Self::render_seg_btn(
+            "v6-mode-disabled",
+            "关闭 IPv6",
+            self.v6_kind == Ipv6Kind::Disabled,
+            0xc2410c,
+            0xfb923c,
+            |this, _, _, cx| this.set_v6_kind(Ipv6Kind::Disabled, cx),
+            cx,
+        );
+
+        let v6_detail: AnyElement = match self.v6_kind {
+            Ipv6Kind::Dhcp => div()
+                .p(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(0x0b1220))
+                .text_size(px(11.))
+                .text_color(rgb(0x94a3b8))
+                .child("应用此 Profile 时，将启用 IPv6 并设为自动获取 (SLAAC / DHCPv6 / 自动 DNS)。")
+                .into_any_element(),
+            Ipv6Kind::Static => div()
                 .flex()
                 .flex_col()
-                .gap(px(10.))
+                .gap(px(8.))
                 .child(
                     div()
                         .flex()
                         .gap(px(10.))
-                        .child(Self::render_field("静态 IPv4 地址", self.ip_input.clone()))
-                        .child(Self::render_field("子网掩码", self.mask_input.clone())),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(10.))
-                        .child(Self::render_field(
-                            "默认网关 (如旁路由 IP)",
-                            self.gateway_input.clone(),
-                        ))
-                        .child(Self::render_field(
-                            "网关跃点数 (0=自动)",
-                            self.metric_input.clone(),
-                        )),
-                )
-                .child(Self::render_field(
-                    "DNS 服务器（多条请用英文逗号分隔）",
-                    self.dns_input.clone(),
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .justify_end()
+                        .child(Self::render_field("IPv6 地址", self.v6_ip_input.clone()))
                         .child(
                             div()
-                                .id("btn-import-current")
-                                .px(px(10.))
-                                .py(px(5.))
-                                .rounded(px(6.))
-                                .bg(rgb(0x1e293b))
-                                .border_1()
-                                .border_color(rgb(0x334155))
-                                .text_size(px(11.))
-                                .text_color(rgb(0x93c5fd))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x334155)))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.import_selected_adapter_info(cx);
-                                    }),
-                                )
-                                .child("从当前网卡导入 IP / 网关 / DNS"),
+                                .w(px(120.))
+                                .child(Self::render_field("前缀长度", self.v6_prefix_input.clone())),
                         ),
                 )
-                .into_any_element()
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(Self::render_field(
+                            "IPv6 默认网关 (可选)",
+                            self.v6_gateway_input.clone(),
+                        ))
+                        .child(Self::render_field(
+                            "IPv6 DNS (可选，逗号分隔)",
+                            self.v6_dns_input.clone(),
+                        )),
+                )
+                .child(
+                    div().flex().justify_end().child(
+                        div()
+                            .id("btn-import-v6")
+                            .px(px(10.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .bg(rgb(0x1e293b))
+                            .border_1()
+                            .border_color(rgb(0x334155))
+                            .text_size(px(11.))
+                            .text_color(rgb(0xc4b5fd))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x334155)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| this.import_current_ipv6(cx)),
+                            )
+                            .child("导入当前网卡 IPv6"),
+                    ),
+                )
+                .into_any_element(),
+            Ipv6Kind::Disabled => div()
+                .p(px(10.))
+                .rounded(px(6.))
+                .bg(rgb(0x0b1220))
+                .text_size(px(11.))
+                .text_color(rgb(0xfdba74))
+                .child("应用此 Profile 时，将禁用该网卡的 TCP/IPv6 绑定 (ms_tcpip6)。仅在点击「切换 / 应用」时生效。")
+                .into_any_element(),
         };
 
         div()
@@ -1196,7 +1424,7 @@ impl ConfigWindow {
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(0xe2e8f0))
-                            .child("Profile 详细配置"),
+                            .child("Profile 详细配置（IPv4 与 IPv6 独立设置，应用时统一生效）"),
                     )
                     .child(
                         div()
@@ -1247,250 +1475,135 @@ impl ConfigWindow {
                     ),
             )
             .child(Self::render_field("Profile 名称", self.name_input.clone()))
-            // Mode Segmented Control
+            // IPv4 Section
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
+                    .gap(px(8.))
+                    .p(px(11.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x0f172a))
+                    .border_1()
+                    .border_color(rgb(0x1e293b))
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(0x94a3b8))
-                            .child("网络模式"),
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x93c5fd))
+                            .child("IPv4 配置"),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
-                            .child(
-                                div()
-                                    .id("mode-btn-static")
-                                    .flex_1()
-                                    .py(px(7.))
-                                    .rounded(px(6.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .cursor_pointer()
-                                    .bg(if !self.editor_is_dhcp {
-                                        rgb(0x2563eb)
-                                    } else {
-                                        rgb(0x0f172a)
-                                    })
-                                    .border_1()
-                                    .border_color(if !self.editor_is_dhcp {
-                                        rgb(0x60a5fa)
-                                    } else {
-                                        rgb(0x334155)
-                                    })
-                                    .text_color(rgb(0xf8fafc))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.set_editor_mode(false, cx);
-                                        }),
-                                    )
-                                    .child("静态 IP / 固定网关"),
-                            )
-                            .child(
-                                div()
-                                    .id("mode-btn-dhcp")
-                                    .flex_1()
-                                    .py(px(7.))
-                                    .rounded(px(6.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .cursor_pointer()
-                                    .bg(if self.editor_is_dhcp {
-                                        rgb(0x059669)
-                                    } else {
-                                        rgb(0x0f172a)
-                                    })
-                                    .border_1()
-                                    .border_color(if self.editor_is_dhcp {
-                                        rgb(0x34d399)
-                                    } else {
-                                        rgb(0x334155)
-                                    })
-                                    .text_color(rgb(0xf8fafc))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.set_editor_mode(true, cx);
-                                        }),
-                                    )
-                                    .child("DHCP 自动获取"),
-                            ),
-                    ),
+                            .child(v4_btn_static)
+                            .child(v4_btn_dhcp)
+                            .child(v4_btn_disabled),
+                    )
+                    .child(v4_detail),
             )
-            .child(mode_section)
-            // IPv6 Policy Segmented Control for this Profile
+            // IPv6 Section
             .child(
                 div()
                     .flex()
                     .flex_col()
-                    .gap(px(5.))
+                    .gap(px(8.))
+                    .p(px(11.))
+                    .rounded(px(8.))
+                    .bg(rgb(0x0f172a))
+                    .border_1()
+                    .border_color(rgb(0x1e293b))
                     .child(
                         div()
                             .text_size(px(12.))
-                            .text_color(rgb(0x94a3b8))
-                            .child("切换到此 Profile 时的 IPv6 策略 (ms_tcpip6)"),
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgb(0x5eead4))
+                            .child("IPv6 配置"),
                     )
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
-                            .child(
-                                div()
-                                    .id("ipv6-policy-keep")
-                                    .flex_1()
-                                    .py(px(6.))
-                                    .rounded(px(6.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .cursor_pointer()
-                                    .bg(if self.editor_ipv6 == Ipv6Setting::Keep {
-                                        rgb(0x334155)
-                                    } else {
-                                        rgb(0x0f172a)
-                                    })
-                                    .border_1()
-                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Keep {
-                                        rgb(0x94a3b8)
-                                    } else {
-                                        rgb(0x334155)
-                                    })
-                                    .text_color(rgb(0xf8fafc))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.set_editor_ipv6(Ipv6Setting::Keep, cx);
-                                        }),
-                                    )
-                                    .child(Ipv6Setting::Keep.display_name()),
-                            )
-                            .child(
-                                div()
-                                    .id("ipv6-policy-disable")
-                                    .flex_1()
-                                    .py(px(6.))
-                                    .rounded(px(6.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .cursor_pointer()
-                                    .bg(if self.editor_ipv6 == Ipv6Setting::Disable {
-                                        rgb(0xc2410c)
-                                    } else {
-                                        rgb(0x0f172a)
-                                    })
-                                    .border_1()
-                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Disable {
-                                        rgb(0xfb923c)
-                                    } else {
-                                        rgb(0x334155)
-                                    })
-                                    .text_color(rgb(0xf8fafc))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.set_editor_ipv6(Ipv6Setting::Disable, cx);
-                                        }),
-                                    )
-                                    .child(Ipv6Setting::Disable.display_name()),
-                            )
-                            .child(
-                                div()
-                                    .id("ipv6-policy-enable")
-                                    .flex_1()
-                                    .py(px(6.))
-                                    .rounded(px(6.))
-                                    .text_center()
-                                    .text_size(px(12.))
-                                    .cursor_pointer()
-                                    .bg(if self.editor_ipv6 == Ipv6Setting::Enable {
-                                        rgb(0x0f766e)
-                                    } else {
-                                        rgb(0x0f172a)
-                                    })
-                                    .border_1()
-                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Enable {
-                                        rgb(0x2dd4bf)
-                                    } else {
-                                        rgb(0x334155)
-                                    })
-                                    .text_color(rgb(0xf8fafc))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, _, cx| {
-                                            this.set_editor_ipv6(Ipv6Setting::Enable, cx);
-                                        }),
-                                    )
-                                    .child(Ipv6Setting::Enable.display_name()),
-                            ),
-                    ),
+                            .child(v6_btn_dhcp)
+                            .child(v6_btn_static)
+                            .child(v6_btn_disabled),
+                    )
+                    .child(v6_detail),
             )
             .into_any_element()
     }
 }
 
-fn extract_profile_editor_fields(
-    profile: Option<&NetworkProfile>,
-) -> (
-    String,
-    bool,
-    bool,
-    Ipv6Setting,
-    String,
-    String,
-    String,
-    String,
-    String,
-) {
-    let Some(p) = profile else {
-        return (
-            String::new(),
-            false,
-            true,
-            Ipv6Setting::Keep,
-            String::new(),
-            "255.255.255.0".to_string(),
-            String::new(),
-            "0".to_string(),
-            String::new(),
-        );
+fn extract_editor_fields(profile: Option<&NetworkProfile>) -> EditorFields {
+    let mut fields = EditorFields {
+        name: String::new(),
+        v4_kind: Ipv4Kind::Static,
+        v4_renew: true,
+        v4_ip: "192.168.1.100".to_string(),
+        v4_mask: "255.255.255.0".to_string(),
+        v4_gateway: "192.168.1.2".to_string(),
+        v4_metric: "0".to_string(),
+        v4_dns: "192.168.1.1".to_string(),
+        v6_kind: Ipv6Kind::Dhcp,
+        v6_ip: String::new(),
+        v6_prefix: "64".to_string(),
+        v6_gateway: String::new(),
+        v6_dns: String::new(),
     };
-    match &p.mode {
-        ProfileMode::Dhcp { renew_on_switch } => (
-            p.name.clone(),
-            true,
-            *renew_on_switch,
-            p.ipv6,
-            "192.168.1.100".to_string(),
-            "255.255.255.0".to_string(),
-            "192.168.1.2".to_string(),
-            "0".to_string(),
-            "192.168.1.1".to_string(),
-        ),
-        ProfileMode::Static {
+
+    let Some(p) = profile else {
+        return fields;
+    };
+
+    fields.name = p.name.clone();
+
+    match &p.ipv4 {
+        Ipv4Config::Static {
             ip,
             subnet_mask,
             gateway,
             gateway_metric,
             dns,
-        } => (
-            p.name.clone(),
-            false,
-            true,
-            p.ipv6,
-            ip.clone(),
-            subnet_mask.clone(),
-            gateway.clone(),
-            gateway_metric.to_string(),
-            dns.join(", "),
-        ),
+        } => {
+            fields.v4_kind = Ipv4Kind::Static;
+            fields.v4_ip = ip.clone();
+            fields.v4_mask = subnet_mask.clone();
+            fields.v4_gateway = gateway.clone();
+            fields.v4_metric = gateway_metric.to_string();
+            fields.v4_dns = dns.join(", ");
+        }
+        Ipv4Config::Dhcp { renew_on_switch } => {
+            fields.v4_kind = Ipv4Kind::Dhcp;
+            fields.v4_renew = *renew_on_switch;
+        }
+        Ipv4Config::Disabled => {
+            fields.v4_kind = Ipv4Kind::Disabled;
+        }
     }
+
+    match &p.ipv6 {
+        Ipv6Config::Dhcp => {
+            fields.v6_kind = Ipv6Kind::Dhcp;
+        }
+        Ipv6Config::Disabled => {
+            fields.v6_kind = Ipv6Kind::Disabled;
+        }
+        Ipv6Config::Static {
+            ip,
+            prefix_length,
+            gateway,
+            dns,
+        } => {
+            fields.v6_kind = Ipv6Kind::Static;
+            fields.v6_ip = ip.clone();
+            fields.v6_prefix = prefix_length.to_string();
+            fields.v6_gateway = gateway.clone();
+            fields.v6_dns = dns.join(", ");
+        }
+    }
+
+    fields
 }
 
 impl Render for ConfigWindow {
@@ -1543,10 +1656,8 @@ impl Render for ConfigWindow {
             },
             cx,
         );
-        let interval_field = Self::render_field(
-            "后台轮询间隔（秒，最小 3）",
-            self.interval_input.clone(),
-        );
+        let interval_field =
+            Self::render_field("后台轮询间隔（秒，最小 3）", self.interval_input.clone());
 
         let status_badge_text = if let Some(ref target) = self.switching_profile_name {
             format!("正在切换到 {}...", target)
@@ -1605,7 +1716,7 @@ impl Render for ConfigWindow {
                                             .text_size(px(11.))
                                             .text_color(rgb(0xf8fafc))
                                             .child(if self.is_admin {
-                                                "管理员权限"
+                                                "管理员 · 单实例"
                                             } else {
                                                 "非管理员"
                                             }),
@@ -1616,7 +1727,7 @@ impl Render for ConfigWindow {
                                     .text_size(px(11.))
                                     .text_color(rgb(0x94a3b8))
                                     .child(format!(
-                                        "配置文件: {}  ·  关闭窗口后程序继续常驻右下角托盘",
+                                        "配置文件: {}  ·  关闭窗口后继续常驻右下角托盘",
                                         self.config_path.display()
                                     )),
                             ),
@@ -1641,7 +1752,7 @@ impl Render for ConfigWindow {
                             .child("刷新网卡状态"),
                     ),
             )
-            // Body (Three Columns: Adapters | Profiles | Editor)
+            // Body (Three Columns)
             .child(
                 div()
                     .flex()
@@ -1652,7 +1763,7 @@ impl Render for ConfigWindow {
                     // Column 1: Network Adapters
                     .child(
                         div()
-                            .w(px(245.))
+                            .w(px(235.))
                             .flex()
                             .flex_col()
                             .gap(px(8.))
@@ -1692,10 +1803,10 @@ impl Render for ConfigWindow {
                                     .children(adapter_cards),
                             ),
                     )
-                    // Column 2: Profiles for Selected Adapter
+                    // Column 2: Profiles
                     .child(
                         div()
-                            .w(px(240.))
+                            .w(px(245.))
                             .flex()
                             .flex_col()
                             .gap(px(8.))
@@ -1756,7 +1867,7 @@ impl Render for ConfigWindow {
                                                     this.add_profile(false, cx);
                                                 }),
                                             )
-                                            .child("+ 静态 IP"),
+                                            .child("+ 静态模板"),
                                     )
                                     .child(
                                         div()
@@ -1776,11 +1887,11 @@ impl Render for ConfigWindow {
                                                     this.add_profile(true, cx);
                                                 }),
                                             )
-                                            .child("+ DHCP"),
+                                            .child("+ DHCP 模板"),
                                     ),
                             ),
                     )
-                    // Column 3: Live Status + Selected Profile Editor + Global Tray Options
+                    // Column 3: Live Status (read-only) + Editor + Tray Settings
                     .child(
                         div()
                             .id("right-config-scroll")
@@ -1790,7 +1901,7 @@ impl Render for ConfigWindow {
                             .min_h(px(0.))
                             .gap(px(10.))
                             .overflow_y_scroll()
-                            // Live Status Card
+                            // Live Status Card (read-only display + cycle next)
                             .child(
                                 div()
                                     .flex()
@@ -1815,7 +1926,10 @@ impl Render for ConfigWindow {
                                                         div()
                                                             .text_size(px(13.))
                                                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .child(format!("网卡实时状态: {}", active_iface)),
+                                                            .child(format!(
+                                                                "网卡实时状态: {}",
+                                                                active_iface
+                                                            )),
                                                     )
                                                     .child(
                                                         div()
@@ -1828,120 +1942,32 @@ impl Render for ConfigWindow {
                                                             .child(status_badge_text),
                                                     ),
                                             )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(8.))
-                                                    .when(active_profiles.len() >= 2, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .id("btn-live-cycle-next")
-                                                                .px(px(10.))
-                                                                .py(px(4.))
-                                                                .rounded(px(6.))
-                                                                .bg(if is_switching {
-                                                                    rgb(0x334155)
-                                                                } else {
-                                                                    rgb(0x2563eb)
-                                                                })
-                                                                .text_size(px(11.))
-                                                                .font_weight(
-                                                                    gpui::FontWeight::MEDIUM,
-                                                                )
-                                                                .text_color(rgb(0xffffff))
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(|this, _, _, cx| {
-                                                                        this.apply_next_profile(cx);
-                                                                    }),
-                                                                )
-                                                                .child("一键切换下一套"),
+                                            .when(active_profiles.len() >= 2, |this| {
+                                                this.child(
+                                                    div()
+                                                        .id("btn-live-cycle-next")
+                                                        .px(px(10.))
+                                                        .py(px(4.))
+                                                        .rounded(px(6.))
+                                                        .bg(if is_switching {
+                                                            rgb(0x334155)
+                                                        } else {
+                                                            rgb(0x2563eb)
+                                                        })
+                                                        .text_size(px(11.))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(rgb(0xffffff))
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            cx.listener(|this, _, _, cx| {
+                                                                this.apply_next_profile(cx);
+                                                            }),
                                                         )
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .id("btn-live-toggle-ipv6")
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap(px(8.))
-                                                            .px(px(10.))
-                                                            .py(px(4.))
-                                                            .rounded(px(6.))
-                                                            .bg(if self.current_status.ipv6_enabled
-                                                            {
-                                                                rgb(0x064e3b)
-                                                            } else {
-                                                                rgb(0x1e293b)
-                                                            })
-                                                            .border_1()
-                                                            .border_color(
-                                                                if self.current_status.ipv6_enabled
-                                                                {
-                                                                    rgb(0x10b981)
-                                                                } else {
-                                                                    rgb(0x475569)
-                                                                },
-                                                            )
-                                                            .cursor_pointer()
-                                                            .hover(|s| s.border_color(rgb(0x93c5fd)))
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(|this, _, _, cx| {
-                                                                    this.toggle_active_adapter_ipv6(
-                                                                        cx,
-                                                                    );
-                                                                }),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(11.))
-                                                                    .text_color(rgb(0xf8fafc))
-                                                                    .child(
-                                                                        if self
-                                                                            .current_status
-                                                                            .ipv6_enabled
-                                                                        {
-                                                                            "IPv6: 已开启"
-                                                                        } else {
-                                                                            "IPv6: 已关闭"
-                                                                        },
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .w(px(32.))
-                                                                    .h(px(17.))
-                                                                    .rounded_full()
-                                                                    .p(px(2.))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .bg(if self
-                                                                        .current_status
-                                                                        .ipv6_enabled
-                                                                    {
-                                                                        rgb(0x10b981)
-                                                                    } else {
-                                                                        rgb(0x475569)
-                                                                    })
-                                                                    .justify_end()
-                                                                    .when(
-                                                                        !self
-                                                                            .current_status
-                                                                            .ipv6_enabled,
-                                                                        |this| this.justify_start(),
-                                                                    )
-                                                                    .child(
-                                                                        div()
-                                                                            .size(px(13.))
-                                                                            .rounded_full()
-                                                                            .bg(rgb(0xffffff)),
-                                                                    ),
-                                                            ),
-                                                    ),
-                                            ),
+                                                        .child("一键切换下一套"),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -2001,7 +2027,7 @@ impl Render for ConfigWindow {
                             }
                             None => div()
                                 .text_color(rgb(0x64748b))
-                                .child("支持为每张网卡创建多套静态 IP / DHCP Profile，保存后立即同步到托盘菜单"),
+                                .child("修改 IPv4/IPv6 配置仅保存在 Profile 中，点击「切换」或「保存并应用」时统一生效"),
                         },
                     ))
                     .child(
@@ -2045,7 +2071,7 @@ impl Render for ConfigWindow {
                                             this.save_all(cx);
                                         }),
                                     )
-                                    .child("保存配置"),
+                                    .child("仅保存配置"),
                             )
                             .child(
                                 div()
@@ -2076,41 +2102,101 @@ impl Render for ConfigWindow {
     }
 }
 
-pub fn run(config: Config, config_path: PathBuf) {
+fn open_or_focus_window(
+    config_path: &PathBuf,
+    active_view: &Rc<RefCell<Option<WeakEntity<ConfigWindow>>>>,
+    cx: &mut App,
+) {
+    if !cx.windows().is_empty() {
+        let _ = focus_window_by_title(GUI_WINDOW_TITLE);
+        cx.activate(true);
+        if let Some(weak) = active_view.borrow().as_ref() {
+            let _ = weak.update(cx, |this, cx| this.refresh_live_only(cx));
+        }
+        return;
+    }
+
+    let cfg = load_or_default_config(config_path);
+    let bounds = Bounds::centered(None, size(px(1060.0), px(720.0)), cx);
+    let path_clone = config_path.clone();
+
+    if let Ok(handle) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(GUI_WINDOW_TITLE.into()),
+                ..Default::default()
+            }),
+            window_min_size: Some(size(px(880.0), px(580.0))),
+            ..Default::default()
+        },
+        |window, cx| {
+            cx.new(|cx| {
+                let view = ConfigWindow::new(cx, cfg, path_clone);
+                window.focus(&view.focus_handle);
+                view
+            })
+        },
+    ) {
+        if let Ok(weak) = handle.update(cx, |_, _, cx| cx.entity().downgrade()) {
+            *active_view.borrow_mut() = Some(weak);
+        }
+        cx.activate(true);
+    }
+}
+
+pub fn run_app(config_path: PathBuf, gui_rx: Receiver<GuiCommand>, open_on_start: bool) {
+    let rx_shared = Arc::new(Mutex::new(gui_rx));
+
     Application::new().run(move |cx: &mut App| {
         bind_text_input_keys(cx);
         cx.bind_keys([KeyBinding::new("ctrl-w", CloseWindow, None)]);
-        cx.on_window_closed(|cx| {
+
+        let active_view: Rc<RefCell<Option<WeakEntity<ConfigWindow>>>> =
+            Rc::new(RefCell::new(None));
+
+        // Do NOT quit app when closing the config window; keep this single process resident in tray
+        let active_view_for_close = active_view.clone();
+        cx.on_window_closed(move |cx| {
             if cx.windows().is_empty() {
-                cx.quit();
+                *active_view_for_close.borrow_mut() = None;
             }
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1020.0), px(680.0)), cx);
-        let cfg_clone = config.clone();
-        let path_clone = config_path.clone();
+        if open_on_start {
+            open_or_focus_window(&config_path, &active_view, cx);
+        }
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(GUI_WINDOW_TITLE.into()),
-                    ..Default::default()
-                }),
-                window_min_size: Some(size(px(860.0), px(560.0))),
-                ..Default::default()
-            },
-            |window, cx| {
-                cx.new(|cx| {
-                    let view = ConfigWindow::new(cx, cfg_clone, path_clone);
-                    window.focus(&view.focus_handle);
-                    view
-                })
-            },
-        )
-        .expect("failed to open GPUI config window");
+        let path_for_loop = config_path.clone();
+        let active_view_for_loop = active_view.clone();
+        cx.spawn(async move |cx: &mut AsyncApp| loop {
+            let rx = rx_shared.clone();
+            let cmd = cx
+                .background_executor()
+                .spawn(async move { rx.lock().ok().and_then(|r| r.recv().ok()) })
+                .await;
 
-        cx.activate(true);
+            match cmd {
+                Some(GuiCommand::OpenOrFocus) => {
+                    let path = path_for_loop.clone();
+                    let av = active_view_for_loop.clone();
+                    let _ = cx.update(|cx| open_or_focus_window(&path, &av, cx));
+                }
+                Some(GuiCommand::Refresh) => {
+                    let av = active_view_for_loop.clone();
+                    let _ = cx.update(|cx| {
+                        if let Some(weak) = av.borrow().as_ref() {
+                            let _ = weak.update(cx, |this, cx| this.refresh_live_only(cx));
+                        }
+                    });
+                }
+                Some(GuiCommand::Quit) | None => {
+                    let _ = cx.update(|cx| cx.quit());
+                    break;
+                }
+            }
+        })
+        .detach();
     });
 }

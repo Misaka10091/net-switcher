@@ -1,13 +1,12 @@
 {
-  "version": 2,
+  "version": 3,
   "activeInterface": "WLAN",
   "profiles": [
     {
       "id": "wlan-static-gateway",
       "name": "旁路由固定网关",
       "interfaceName": "WLAN",
-      "ipv6": "disable",
-      "mode": {
+      "ipv4": {
         "type": "static",
         "ip": "192.168.1.100",
         "subnetMask": "255.255.255.0",
@@ -16,16 +15,21 @@
         "dns": [
           "192.168.1.1"
         ]
+      },
+      "ipv6": {
+        "type": "disabled"
       }
     },
     {
       "id": "wlan-dhcp-auto",
-      "name": "DHCP 自动获取",
+      "name": "DHCP 双栈自动",
       "interfaceName": "WLAN",
-      "ipv6": "enable",
-      "mode": {
+      "ipv4": {
         "type": "dhcp",
         "renewOnSwitch": true
+      },
+      "ipv6": {
+        "type": "dhcp"
       }
     }
   ],
