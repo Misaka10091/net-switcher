@@ -24,6 +24,7 @@ use crate::gui::GUI_WINDOW_TITLE;
 use crate::icon::{OwnedIcon, TrayVisualState, create_state_icon};
 use crate::net::{
     NetChangeWatcher, NetworkMode, NetworkStatus, apply_profile, pick_next_profile, query_status,
+    set_interface_ipv6,
 };
 use crate::winutil::{
     copy_to_wide_buf, focus_window_by_title, launch_gui_process, open_file_in_shell, to_wide_null,
@@ -37,6 +38,7 @@ const WM_APP_NET_CHANGED: u32 = WM_APP + 2;
 const WM_APP_SWITCH_DONE: u32 = WM_APP + 3;
 pub const WM_APP_RELOAD_CONFIG: u32 = WM_APP + 4;
 pub const WM_APP_OPEN_GUI: u32 = WM_APP + 5;
+const WM_APP_IPV6_DONE: u32 = WM_APP + 6;
 
 const TIMER_POLL_ID: usize = 1;
 const TIMER_DEBOUNCE_ID: usize = 2;
@@ -47,11 +49,17 @@ const CMD_REFRESH: u32 = 1003;
 const CMD_OPEN_CONFIG: u32 = 1004;
 const CMD_RELOAD_CONFIG: u32 = 1005;
 const CMD_TOGGLE_AUTOSTART: u32 = 1006;
-const CMD_EXIT: u32 = 1007;
+const CMD_TOGGLE_IPV6: u32 = 1007;
+const CMD_EXIT: u32 = 1008;
 const CMD_PROFILE_BASE: u32 = 2000;
 
 struct SwitchResult {
     profile: NetworkProfile,
+    outcome: Result<NetworkStatus, String>,
+}
+
+struct Ipv6Result {
+    enable: bool,
     outcome: Result<NetworkStatus, String>,
 }
 
@@ -253,6 +261,63 @@ impl AppState {
         }
     }
 
+    fn start_toggle_ipv6(&mut self) {
+        if self.is_switching() {
+            return;
+        }
+        self.status = query_status(&self.config);
+        let enable = !self.status.ipv6_enabled;
+        let iface = self.config.active_interface.clone();
+        let all_profiles = self.config.profiles.clone();
+        self.switching_to = Some(if enable {
+            "开启 IPv6".to_string()
+        } else {
+            "关闭 IPv6".to_string()
+        });
+        self.update_tray_icon();
+
+        let hwnd_raw = self.hwnd as isize;
+        thread::spawn(move || {
+            let outcome = set_interface_ipv6(&iface, enable, &all_profiles);
+            let boxed = Box::new(Ipv6Result { enable, outcome });
+            let ptr = Box::into_raw(boxed) as LPARAM;
+            unsafe {
+                PostMessageW(hwnd_raw as HWND, WM_APP_IPV6_DONE, 0, ptr);
+            }
+        });
+    }
+
+    fn handle_ipv6_done(&mut self, res: Ipv6Result) {
+        self.switching_to = None;
+        match res.outcome {
+            Ok(new_status) => {
+                self.status = new_status;
+                self.update_tray_icon();
+                let title = if res.enable {
+                    "已开启 IPv6"
+                } else {
+                    "已关闭 IPv6"
+                };
+                let body = format!(
+                    "网卡: {}\n{}",
+                    self.status.interface_name,
+                    self.status.summary_line()
+                );
+                self.show_notification(title, &body, false);
+            }
+            Err(err) => {
+                self.status = query_status(&self.config);
+                self.update_tray_icon();
+                let title = if res.enable {
+                    "开启 IPv6 失败"
+                } else {
+                    "关闭 IPv6 失败"
+                };
+                self.show_notification(title, &err, true);
+            }
+        }
+    }
+
     fn reload_config(&mut self, notify: bool) {
         match load_config(&self.config_path) {
             Ok(new_cfg) => {
@@ -326,11 +391,16 @@ impl AppState {
                 self.status.gateway.as_deref().unwrap_or("-")
             );
             let dns_line = format!(
-                "DNS: {}",
+                "DNS: {}   IPv6: {}",
                 if self.status.dns.is_empty() {
                     "-".to_string()
                 } else {
                     self.status.dns.join(", ")
+                },
+                if self.status.ipv6_enabled {
+                    "开启"
+                } else {
+                    "关闭"
                 }
             );
 
@@ -403,6 +473,20 @@ impl AppState {
             }
 
             AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+            let ipv6_flags = switch_flags
+                | if self.status.ipv6_enabled {
+                    MF_CHECKED
+                } else {
+                    0
+                };
+            append_item(
+                menu,
+                ipv6_flags,
+                CMD_TOGGLE_IPV6 as usize,
+                &format!("启用 IPv6 ({})", self.config.active_interface),
+            );
+
+            AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
             append_item(
                 menu,
                 MF_STRING,
@@ -467,6 +551,7 @@ impl AppState {
                     }
                 }
                 CMD_RELOAD_CONFIG => self.reload_config(true),
+                CMD_TOGGLE_IPV6 => self.start_toggle_ipv6(),
                 CMD_TOGGLE_AUTOSTART => self.toggle_autostart(),
                 CMD_EXIT => {
                     DestroyWindow(self.hwnd);
@@ -606,6 +691,13 @@ unsafe extern "system" fn wnd_proc(
                 if lparam != 0 {
                     let res = unsafe { Box::from_raw(lparam as *mut SwitchResult) };
                     state.handle_switch_done(*res);
+                }
+                return 0;
+            }
+            WM_APP_IPV6_DONE => {
+                if lparam != 0 {
+                    let res = unsafe { Box::from_raw(lparam as *mut Ipv6Result) };
+                    state.handle_ipv6_done(*res);
                 }
                 return 0;
             }

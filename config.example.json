@@ -6,6 +6,7 @@
       "id": "wlan-static-gateway",
       "name": "旁路由固定网关",
       "interfaceName": "WLAN",
+      "ipv6": "disable",
       "mode": {
         "type": "static",
         "ip": "192.168.1.100",
@@ -21,6 +22,7 @@
       "id": "wlan-dhcp-auto",
       "name": "DHCP 自动获取",
       "interfaceName": "WLAN",
+      "ipv6": "enable",
       "mode": {
         "type": "dhcp",
         "renewOnSwitch": true

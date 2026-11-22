@@ -9,12 +9,12 @@ use gpui::{
 };
 
 use crate::config::{
-    Config, NetworkProfile, ProfileMode, load_config, save_config, validate_config,
+    Config, Ipv6Setting, NetworkProfile, ProfileMode, load_config, save_config, validate_config,
     validate_profile,
 };
 use crate::net::{
     AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters,
-    query_interface_status,
+    query_interface_status, set_interface_ipv6,
 };
 use crate::tray::{TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG};
 use crate::winutil::{is_elevated, notify_tray_message};
@@ -48,6 +48,7 @@ struct ConfigWindow {
     name_input: Entity<TextInput>,
     editor_is_dhcp: bool,
     editor_renew_on_switch: bool,
+    editor_ipv6: Ipv6Setting,
     ip_input: Entity<TextInput>,
     mask_input: Entity<TextInput>,
     gateway_input: Entity<TextInput>,
@@ -91,6 +92,7 @@ impl ConfigWindow {
             init_name,
             init_is_dhcp,
             init_renew,
+            init_ipv6,
             init_ip,
             init_mask,
             init_gw,
@@ -125,6 +127,7 @@ impl ConfigWindow {
             name_input,
             editor_is_dhcp: init_is_dhcp,
             editor_renew_on_switch: init_renew,
+            editor_ipv6: init_ipv6,
             ip_input,
             mask_input,
             gateway_input,
@@ -157,6 +160,7 @@ impl ConfigWindow {
         };
 
         profile.name = self.name_input.read(cx).text().trim().to_string();
+        profile.ipv6 = self.editor_ipv6;
 
         if self.editor_is_dhcp {
             profile.mode = ProfileMode::Dhcp {
@@ -201,11 +205,12 @@ impl ConfigWindow {
             .and_then(|id| self.draft_config.profiles.iter().find(|p| p.id == id))
             .cloned();
 
-        let (name, is_dhcp, renew, ip, mask, gw, metric, dns) =
+        let (name, is_dhcp, renew, ipv6, ip, mask, gw, metric, dns) =
             extract_profile_editor_fields(profile.as_ref());
 
         self.editor_is_dhcp = is_dhcp;
         self.editor_renew_on_switch = renew;
+        self.editor_ipv6 = ipv6;
         self.name_input.update(cx, |i, cx| i.set_text(name, cx));
         self.ip_input.update(cx, |i, cx| i.set_text(ip, cx));
         self.mask_input.update(cx, |i, cx| i.set_text(mask, cx));
@@ -316,6 +321,7 @@ impl ConfigWindow {
             name: name.clone(),
             interface_name: iface,
             mode,
+            ipv6: Ipv6Setting::Keep,
         };
         self.draft_config.profiles.push(profile);
         self.selected_profile_id = Some(id);
@@ -348,6 +354,7 @@ impl ConfigWindow {
             name: new_name.clone(),
             interface_name: orig.interface_name,
             mode: orig.mode,
+            ipv6: orig.ipv6,
         };
         self.draft_config.profiles.push(copy);
         self.selected_profile_id = Some(new_id);
@@ -394,6 +401,76 @@ impl ConfigWindow {
         self.editor_is_dhcp = is_dhcp;
         let _ = self.sync_editor_into_draft(cx);
         cx.notify();
+    }
+
+    fn set_editor_ipv6(&mut self, setting: Ipv6Setting, cx: &mut Context<Self>) {
+        if self.editor_ipv6 == setting {
+            return;
+        }
+        self.editor_ipv6 = setting;
+        let _ = self.sync_editor_into_draft(cx);
+        cx.notify();
+    }
+
+    fn toggle_active_adapter_ipv6(&mut self, cx: &mut Context<Self>) {
+        if self.switching_profile_name.is_some() {
+            return;
+        }
+        if !self.is_admin {
+            self.banner = Some(Banner::Error(
+                "当前不是管理员权限，无法修改网卡 IPv6 开关；请以管理员身份运行或从托盘打开"
+                    .into(),
+            ));
+            cx.notify();
+            return;
+        }
+
+        let iface = self.draft_config.active_interface.clone();
+        let next_enable = !self.current_status.ipv6_enabled;
+        let all_profiles = self.draft_config.profiles.clone();
+        let action_label = if next_enable { "开启 IPv6" } else { "关闭 IPv6" };
+
+        self.switching_profile_name = Some(action_label.to_string());
+        self.banner = Some(Banner::Info(
+            format!("正在对网卡「{}」执行 {}...", iface, action_label).into(),
+        ));
+        cx.notify();
+
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { set_interface_ipv6(&iface, next_enable, &all_profiles) })
+                .await;
+
+            let _ = view.update(cx, |this, cx| {
+                this.switching_profile_name = None;
+                this.adapters = list_adapters();
+                match result {
+                    Ok(status) => {
+                        this.current_status = status;
+                        let _ = notify_tray_message(TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG);
+                        this.banner = Some(Banner::Success(
+                            format!(
+                                "网卡「{}」已{}（{}）",
+                                this.current_status.interface_name,
+                                action_label,
+                                this.current_status.summary_line()
+                            )
+                            .into(),
+                        ));
+                    }
+                    Err(err) => {
+                        this.current_status = query_interface_status(
+                            &this.draft_config.active_interface,
+                            &this.draft_config.profiles,
+                        );
+                        this.banner = Some(Banner::Error(err.into()));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn import_selected_adapter_info(&mut self, cx: &mut Context<Self>) {
@@ -681,9 +758,10 @@ impl ConfigWindow {
                     .text_size(px(11.))
                     .text_color(rgb(0xcbd5e1))
                     .child(format!(
-                        "{} · {}",
+                        "{} · {} · IPv6{}",
                         ip_text,
-                        if adapter.dhcp_enabled { "DHCP" } else { "静态" }
+                        if adapter.dhcp_enabled { "DHCP" } else { "静态" },
+                        if adapter.ipv6_enabled { "开" } else { "关" }
                     )),
             )
             .into_any_element()
@@ -737,13 +815,35 @@ impl ConfigWindow {
                     )
                     .child(
                         div()
-                            .px(px(6.))
-                            .py(px(1.))
-                            .rounded(px(4.))
-                            .bg(mode_bg)
-                            .text_size(px(10.))
-                            .text_color(rgb(0xf8fafc))
-                            .child(mode_label),
+                            .flex()
+                            .gap(px(4.))
+                            .when_some(profile.ipv6.short_badge(), |this, badge| {
+                                let badge_bg = match profile.ipv6 {
+                                    Ipv6Setting::Disable => rgb(0x9a3412),
+                                    Ipv6Setting::Enable => rgb(0x0f766e),
+                                    Ipv6Setting::Keep => rgb(0x334155),
+                                };
+                                this.child(
+                                    div()
+                                        .px(px(5.))
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .bg(badge_bg)
+                                        .text_size(px(10.))
+                                        .text_color(rgb(0xf8fafc))
+                                        .child(badge),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(mode_bg)
+                                    .text_size(px(10.))
+                                    .text_color(rgb(0xf8fafc))
+                                    .child(mode_label),
+                            ),
                     ),
             )
             .child(
@@ -1122,18 +1222,134 @@ impl ConfigWindow {
                     ),
             )
             .child(mode_section)
+            // IPv6 Policy Segmented Control for this Profile
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(0x94a3b8))
+                            .child("切换到此 Profile 时的 IPv6 策略 (ms_tcpip6)"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .id("ipv6-policy-keep")
+                                    .flex_1()
+                                    .py(px(6.))
+                                    .rounded(px(6.))
+                                    .text_center()
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .bg(if self.editor_ipv6 == Ipv6Setting::Keep {
+                                        rgb(0x334155)
+                                    } else {
+                                        rgb(0x0f172a)
+                                    })
+                                    .border_1()
+                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Keep {
+                                        rgb(0x94a3b8)
+                                    } else {
+                                        rgb(0x334155)
+                                    })
+                                    .text_color(rgb(0xf8fafc))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_editor_ipv6(Ipv6Setting::Keep, cx);
+                                        }),
+                                    )
+                                    .child(Ipv6Setting::Keep.display_name()),
+                            )
+                            .child(
+                                div()
+                                    .id("ipv6-policy-disable")
+                                    .flex_1()
+                                    .py(px(6.))
+                                    .rounded(px(6.))
+                                    .text_center()
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .bg(if self.editor_ipv6 == Ipv6Setting::Disable {
+                                        rgb(0xc2410c)
+                                    } else {
+                                        rgb(0x0f172a)
+                                    })
+                                    .border_1()
+                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Disable {
+                                        rgb(0xfb923c)
+                                    } else {
+                                        rgb(0x334155)
+                                    })
+                                    .text_color(rgb(0xf8fafc))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_editor_ipv6(Ipv6Setting::Disable, cx);
+                                        }),
+                                    )
+                                    .child(Ipv6Setting::Disable.display_name()),
+                            )
+                            .child(
+                                div()
+                                    .id("ipv6-policy-enable")
+                                    .flex_1()
+                                    .py(px(6.))
+                                    .rounded(px(6.))
+                                    .text_center()
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .bg(if self.editor_ipv6 == Ipv6Setting::Enable {
+                                        rgb(0x0f766e)
+                                    } else {
+                                        rgb(0x0f172a)
+                                    })
+                                    .border_1()
+                                    .border_color(if self.editor_ipv6 == Ipv6Setting::Enable {
+                                        rgb(0x2dd4bf)
+                                    } else {
+                                        rgb(0x334155)
+                                    })
+                                    .text_color(rgb(0xf8fafc))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_editor_ipv6(Ipv6Setting::Enable, cx);
+                                        }),
+                                    )
+                                    .child(Ipv6Setting::Enable.display_name()),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 }
 
 fn extract_profile_editor_fields(
     profile: Option<&NetworkProfile>,
-) -> (String, bool, bool, String, String, String, String, String) {
+) -> (
+    String,
+    bool,
+    bool,
+    Ipv6Setting,
+    String,
+    String,
+    String,
+    String,
+    String,
+) {
     let Some(p) = profile else {
         return (
             String::new(),
             false,
             true,
+            Ipv6Setting::Keep,
             String::new(),
             "255.255.255.0".to_string(),
             String::new(),
@@ -1146,6 +1362,7 @@ fn extract_profile_editor_fields(
             p.name.clone(),
             true,
             *renew_on_switch,
+            p.ipv6,
             "192.168.1.100".to_string(),
             "255.255.255.0".to_string(),
             "192.168.1.2".to_string(),
@@ -1162,6 +1379,7 @@ fn extract_profile_editor_fields(
             p.name.clone(),
             false,
             true,
+            p.ipv6,
             ip.clone(),
             subnet_mask.clone(),
             gateway.clone(),
@@ -1504,6 +1722,76 @@ impl Render for ConfigWindow {
                                                             .text_size(px(11.))
                                                             .text_color(rgb(0xffffff))
                                                             .child(status_badge_text),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-live-toggle-ipv6")
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.))
+                                                    .px(px(10.))
+                                                    .py(px(4.))
+                                                    .rounded(px(6.))
+                                                    .bg(if self.current_status.ipv6_enabled {
+                                                        rgb(0x064e3b)
+                                                    } else {
+                                                        rgb(0x1e293b)
+                                                    })
+                                                    .border_1()
+                                                    .border_color(
+                                                        if self.current_status.ipv6_enabled {
+                                                            rgb(0x10b981)
+                                                        } else {
+                                                            rgb(0x475569)
+                                                        },
+                                                    )
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.border_color(rgb(0x93c5fd)))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            this.toggle_active_adapter_ipv6(cx);
+                                                        }),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(11.))
+                                                            .text_color(rgb(0xf8fafc))
+                                                            .child(
+                                                                if self.current_status.ipv6_enabled
+                                                                {
+                                                                    "IPv6: 已开启"
+                                                                } else {
+                                                                    "IPv6: 已关闭"
+                                                                },
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .w(px(32.))
+                                                            .h(px(17.))
+                                                            .rounded_full()
+                                                            .p(px(2.))
+                                                            .flex()
+                                                            .items_center()
+                                                            .bg(if self.current_status.ipv6_enabled
+                                                            {
+                                                                rgb(0x10b981)
+                                                            } else {
+                                                                rgb(0x475569)
+                                                            })
+                                                            .justify_end()
+                                                            .when(
+                                                                !self.current_status.ipv6_enabled,
+                                                                |this| this.justify_start(),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .size(px(13.))
+                                                                    .rounded_full()
+                                                                    .bg(rgb(0xffffff)),
+                                                            ),
                                                     ),
                                             ),
                                     )

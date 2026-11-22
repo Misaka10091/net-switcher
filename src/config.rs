@@ -16,6 +16,33 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Ipv6Setting {
+    #[default]
+    Keep,
+    Enable,
+    Disable,
+}
+
+impl Ipv6Setting {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Ipv6Setting::Keep => "保持不变",
+            Ipv6Setting::Enable => "开启 IPv6",
+            Ipv6Setting::Disable => "关闭 IPv6",
+        }
+    }
+
+    pub fn short_badge(self) -> Option<&'static str> {
+        match self {
+            Ipv6Setting::Keep => None,
+            Ipv6Setting::Enable => Some("开IPv6"),
+            Ipv6Setting::Disable => Some("关IPv6"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkProfile {
@@ -23,6 +50,8 @@ pub struct NetworkProfile {
     pub name: String,
     pub interface_name: String,
     pub mode: ProfileMode,
+    #[serde(default)]
+    pub ipv6: Ipv6Setting,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +196,7 @@ impl Config {
                         gateway_metric: 0,
                         dns: vec!["192.168.1.1".to_string()],
                     },
+                    ipv6: Ipv6Setting::Keep,
                 },
                 NetworkProfile {
                     id: "default-dhcp".to_string(),
@@ -175,6 +205,7 @@ impl Config {
                     mode: ProfileMode::Dhcp {
                         renew_on_switch: true,
                     },
+                    ipv6: Ipv6Setting::Keep,
                 },
             ],
             ui: UiConfig::default(),
@@ -252,6 +283,7 @@ pub fn parse_config_str(raw: &str) -> Result<Config, String> {
                         gateway_metric: legacy.static_cfg.gateway_metric,
                         dns: legacy.static_cfg.dns,
                     },
+                    ipv6: Ipv6Setting::Keep,
                 },
                 NetworkProfile {
                     id: "migrated-dhcp".to_string(),
@@ -260,6 +292,7 @@ pub fn parse_config_str(raw: &str) -> Result<Config, String> {
                     mode: ProfileMode::Dhcp {
                         renew_on_switch: legacy.dhcp.renew_on_switch,
                     },
+                    ipv6: Ipv6Setting::Keep,
                 },
             ],
             ui: legacy.ui,
@@ -378,6 +411,7 @@ mod tests {
               "id": "home-gw",
               "name": "家庭旁路由",
               "interfaceName": "WLAN",
+              "ipv6": "disable",
               "mode": {
                 "type": "static",
                 "ip": "192.168.1.100",
@@ -391,6 +425,7 @@ mod tests {
               "id": "home-dhcp",
               "name": "自动 DHCP",
               "interfaceName": "WLAN",
+              "ipv6": "enable",
               "mode": {
                 "type": "dhcp",
                 "renewOnSwitch": true
@@ -413,5 +448,8 @@ mod tests {
         let cfg = parse_config_str(json).expect("v2 config should parse");
         assert_eq!(cfg.active_profiles().len(), 2);
         assert_eq!(cfg.profiles_for_interface("Ethernet").len(), 1);
+        assert_eq!(cfg.profiles[0].ipv6, Ipv6Setting::Disable);
+        assert_eq!(cfg.profiles[1].ipv6, Ipv6Setting::Enable);
+        assert_eq!(cfg.profiles[2].ipv6, Ipv6Setting::Keep);
     }
 }

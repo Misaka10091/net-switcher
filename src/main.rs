@@ -128,6 +128,7 @@ fn run_cli_status() {
             );
             println!("Active Mode : {}", st.display_label());
             println!("DHCP Enabled: {}", st.dhcp_enabled);
+            println!("IPv6 Enabled: {}", st.ipv6_enabled);
             println!("IPv4        : {}", st.ipv4.as_deref().unwrap_or("-"));
             println!("Subnet Mask : {}", st.subnet_mask.as_deref().unwrap_or("-"));
             println!("Gateway     : {}", st.gateway.as_deref().unwrap_or("-"));

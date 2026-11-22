@@ -9,14 +9,14 @@ use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, HANDLE, HWND, NO_ERR
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CancelMibChangeNotify2, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_INCLUDE_PREFIX,
     GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_DHCP_ENABLED,
-    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
+    IP_ADAPTER_IPV6_ENABLED, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE, NotifyIpInterfaceChange,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN};
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::config::{Config, NetworkProfile, ProfileMode};
+use crate::config::{Config, Ipv6Setting, NetworkProfile, ProfileMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkMode {
@@ -43,6 +43,7 @@ pub struct NetworkStatus {
     pub found: bool,
     pub is_up: bool,
     pub dhcp_enabled: bool,
+    pub ipv6_enabled: bool,
     pub ipv4: Option<String>,
     pub subnet_mask: Option<String>,
     pub gateway: Option<String>,
@@ -75,11 +76,13 @@ impl NetworkStatus {
         } else {
             self.dns.join(",")
         };
+        let v6 = if self.ipv6_enabled { "开" } else { "关" };
         format!(
-            "{} [{}]\nIP: {}\nGW: {}\nDNS: {}",
+            "{} [{}]\nIP: {} (IPv6:{})\nGW: {}\nDNS: {}",
             self.interface_name,
             self.display_label(),
             ip,
+            v6,
             gw,
             dns
         )
@@ -93,7 +96,8 @@ impl NetworkStatus {
         } else {
             self.dns.join(", ")
         };
-        format!("IP: {} | 网关: {} | DNS: {}", ip, gw, dns)
+        let v6 = if self.ipv6_enabled { "开启" } else { "关闭" };
+        format!("IP: {} | 网关: {} | DNS: {} | IPv6: {}", ip, gw, dns, v6)
     }
 }
 
@@ -103,6 +107,7 @@ pub struct AdapterSummary {
     pub description: String,
     pub is_up: bool,
     pub dhcp_enabled: bool,
+    pub ipv6_enabled: bool,
     pub ipv4: Option<String>,
     pub subnet_mask: Option<String>,
     pub gateway: Option<String>,
@@ -119,7 +124,7 @@ pub fn list_adapters() -> Vec<AdapterSummary> {
     for _ in 0..3 {
         let ret = unsafe {
             GetAdaptersAddresses(
-                AF_INET as u32,
+                AF_UNSPEC as u32,
                 flags,
                 ptr::null_mut(),
                 buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
@@ -163,6 +168,7 @@ fn extract_adapter_summary(adapter: &IP_ADAPTER_ADDRESSES_LH) -> AdapterSummary 
     let is_up = adapter.OperStatus == IfOperStatusUp;
     let flags = unsafe { adapter.Anonymous2.Flags };
     let dhcp_enabled = (flags & IP_ADAPTER_DHCP_ENABLED) != 0;
+    let ipv6_enabled = (flags & IP_ADAPTER_IPV6_ENABLED) != 0;
 
     let mut ipv4: Option<String> = None;
     let mut subnet_mask: Option<String> = None;
@@ -206,6 +212,7 @@ fn extract_adapter_summary(adapter: &IP_ADAPTER_ADDRESSES_LH) -> AdapterSummary 
         description,
         is_up,
         dhcp_enabled,
+        ipv6_enabled,
         ipv4,
         subnet_mask,
         gateway,
@@ -239,6 +246,7 @@ pub fn query_interface_status(
             found: false,
             is_up: false,
             dhcp_enabled: false,
+            ipv6_enabled: false,
             ipv4: None,
             subnet_mask: None,
             gateway: None,
@@ -256,6 +264,7 @@ pub fn query_interface_status(
         found: true,
         is_up: adapter.is_up,
         dhcp_enabled: adapter.dhcp_enabled,
+        ipv6_enabled: adapter.ipv6_enabled,
         ipv4: adapter.ipv4.clone(),
         subnet_mask: adapter.subnet_mask.clone(),
         gateway: adapter.gateway.clone(),
@@ -341,7 +350,7 @@ pub fn apply_profile(
     profile: &NetworkProfile,
     all_profiles: &[NetworkProfile],
 ) -> Result<NetworkStatus, String> {
-    match &profile.mode {
+    let status = match &profile.mode {
         ProfileMode::Static {
             ip,
             subnet_mask,
@@ -356,9 +365,71 @@ pub fn apply_profile(
             *gateway_metric,
             dns,
             all_profiles,
-        ),
+        )?,
         ProfileMode::Dhcp { renew_on_switch } => {
-            apply_dhcp_mode(&profile.interface_name, *renew_on_switch, all_profiles)
+            apply_dhcp_mode(&profile.interface_name, *renew_on_switch, all_profiles)?
+        }
+    };
+
+    match profile.ipv6 {
+        Ipv6Setting::Keep => Ok(status),
+        Ipv6Setting::Enable => {
+            if status.ipv6_enabled {
+                Ok(status)
+            } else {
+                set_interface_ipv6(&profile.interface_name, true, all_profiles)
+            }
+        }
+        Ipv6Setting::Disable => {
+            if !status.ipv6_enabled {
+                Ok(status)
+            } else {
+                set_interface_ipv6(&profile.interface_name, false, all_profiles)
+            }
+        }
+    }
+}
+
+pub fn set_interface_ipv6(
+    interface_name: &str,
+    enable: bool,
+    all_profiles: &[NetworkProfile],
+) -> Result<NetworkStatus, String> {
+    let escaped = interface_name.replace('\'', "''");
+    let cmdlet = if enable {
+        "Enable-NetAdapterBinding"
+    } else {
+        "Disable-NetAdapterBinding"
+    };
+    let ps_cmd = format!(
+        "{} -Name '{}' -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop | Out-Null",
+        cmdlet, escaped
+    );
+    let args = vec![
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-WindowStyle".to_string(),
+        "Hidden".to_string(),
+        "-Command".to_string(),
+        ps_cmd,
+    ];
+    let res = run_hidden_command("powershell.exe", &args)?;
+    if !res.success {
+        return Err(format!(
+            "{} 网卡「{}」IPv6 失败 (code={:?}): {}",
+            if enable { "开启" } else { "关闭" },
+            interface_name,
+            res.code,
+            res.output
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let st = query_interface_status(interface_name, all_profiles);
+        if st.ipv6_enabled == enable || Instant::now() >= deadline {
+            return Ok(st);
         }
     }
 }
@@ -684,6 +755,7 @@ mod tests {
                         gateway_metric: 0,
                         dns: vec!["192.168.1.1".to_string()],
                     },
+                    ipv6: Ipv6Setting::Disable,
                 },
                 NetworkProfile {
                     id: "p2".to_string(),
@@ -696,6 +768,7 @@ mod tests {
                         gateway_metric: 0,
                         dns: vec!["192.168.1.1".to_string()],
                     },
+                    ipv6: Ipv6Setting::Keep,
                 },
                 NetworkProfile {
                     id: "p3".to_string(),
@@ -704,6 +777,7 @@ mod tests {
                     mode: ProfileMode::Dhcp {
                         renew_on_switch: true,
                     },
+                    ipv6: Ipv6Setting::Enable,
                 },
             ],
             ui: Default::default(),
@@ -714,6 +788,7 @@ mod tests {
             found: true,
             is_up: true,
             dhcp_enabled: false,
+            ipv6_enabled: false,
             ipv4: Some("192.168.1.10".to_string()),
             subnet_mask: Some("255.255.255.0".to_string()),
             gateway: Some("192.168.1.2".to_string()),
