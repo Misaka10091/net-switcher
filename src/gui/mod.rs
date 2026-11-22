@@ -13,7 +13,7 @@ use crate::config::{
     validate_profile,
 };
 use crate::net::{
-    AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters,
+    AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters, pick_next_profile,
     query_interface_status, set_interface_ipv6,
 };
 use crate::tray::{TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG};
@@ -571,6 +571,29 @@ impl ConfigWindow {
     }
 
     fn apply_selected_profile(&mut self, save_first: bool, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_profile_id.clone() {
+            self.apply_profile_by_id(id, save_first, cx);
+        } else {
+            self.banner = Some(Banner::Error("请先在中间栏选择或新建一套 Profile".into()));
+            cx.notify();
+        }
+    }
+
+    fn apply_next_profile(&mut self, cx: &mut Context<Self>) {
+        if self.switching_profile_name.is_some() {
+            return;
+        }
+        let _ = self.sync_editor_into_draft(cx);
+        let next = pick_next_profile(&self.draft_config, &self.current_status).cloned();
+        if let Some(p) = next {
+            self.apply_profile_by_id(p.id, false, cx);
+        } else {
+            self.banner = Some(Banner::Error("当前网卡暂无可切换的 Profile，请先新建".into()));
+            cx.notify();
+        }
+    }
+
+    fn apply_profile_by_id(&mut self, target_id: String, save_first: bool, cx: &mut Context<Self>) {
         if self.switching_profile_name.is_some() {
             return;
         }
@@ -592,20 +615,20 @@ impl ConfigWindow {
             return;
         }
 
-        let Some(selected_id) = self.selected_profile_id.clone() else {
-            self.banner = Some(Banner::Error("请先在中间栏选择或新建一套 Profile".into()));
-            cx.notify();
-            return;
-        };
+        // Select the target profile so user can also see its details on the right
+        if self.selected_profile_id.as_deref() != Some(target_id.as_str()) {
+            self.selected_profile_id = Some(target_id.clone());
+            self.load_selected_profile_into_editor(cx);
+        }
 
         let Some(profile) = self
             .draft_config
             .profiles
             .iter()
-            .find(|p| p.id == selected_id)
+            .find(|p| p.id == target_id)
             .cloned()
         else {
-            self.banner = Some(Banner::Error("未找到选中的 Profile".into()));
+            self.banner = Some(Banner::Error("未找到目标 Profile".into()));
             cx.notify();
             return;
         };
@@ -614,6 +637,13 @@ impl ConfigWindow {
             self.banner = Some(Banner::Error(e.into()));
             cx.notify();
             return;
+        }
+
+        // Persist valid config silently if it has unsaved edits so tray stays in sync
+        if validate_config(&self.draft_config).is_ok() {
+            if save_config(&self.config_path, &self.draft_config).is_ok() {
+                self.saved_config = self.draft_config.clone();
+            }
         }
 
         let all_profiles = self.draft_config.profiles.clone();
@@ -644,7 +674,7 @@ impl ConfigWindow {
                         let _ = notify_tray_message(TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG);
                         this.banner = Some(Banner::Success(
                             format!(
-                                "已应用「{}」（{}）",
+                                "已切换到「{}」（{}）",
                                 target_name,
                                 this.current_status.summary_line()
                             )
@@ -769,8 +799,13 @@ impl ConfigWindow {
 
     fn render_profile_card(&self, profile: &NetworkProfile, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.selected_profile_id.as_deref() == Some(profile.id.as_str());
-        let active_now = self.current_status.matched_profile_id.as_deref() == Some(profile.id.as_str());
-        let id_for_click = profile.id.clone();
+        let active_now =
+            self.current_status.matched_profile_id.as_deref() == Some(profile.id.as_str());
+        let is_switching_any = self.switching_profile_name.is_some();
+        let is_switching_this =
+            self.switching_profile_name.as_deref() == Some(profile.name.as_str());
+        let id_for_select = profile.id.clone();
+        let id_for_apply = profile.id.clone();
 
         let (mode_label, mode_bg) = if profile.mode.is_dhcp() {
             ("DHCP", rgb(0x065f46))
@@ -787,13 +822,19 @@ impl ConfigWindow {
             .rounded(px(8.))
             .bg(if selected { rgb(0x172554) } else { rgb(0x0f172a) })
             .border_1()
-            .border_color(if selected { rgb(0x3b82f6) } else { rgb(0x1e293b) })
+            .border_color(if active_now {
+                rgb(0x10b981)
+            } else if selected {
+                rgb(0x3b82f6)
+            } else {
+                rgb(0x1e293b)
+            })
             .cursor_pointer()
             .hover(|s| s.border_color(rgb(0x60a5fa)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.select_profile(id_for_click.clone(), cx);
+                    this.select_profile(id_for_select.clone(), cx);
                 }),
             )
             .child(
@@ -852,21 +893,84 @@ impl ConfigWindow {
                     .text_color(rgb(0x94a3b8))
                     .child(profile.mode.summary()),
             )
-            .when(active_now, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(5.))
-                        .child(div().size(px(6.)).rounded_full().bg(rgb(0x34d399)))
-                        .child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(rgb(0x34d399))
-                                .child("当前生效中"),
-                        ),
-                )
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .pt(px(2.))
+                    .child(if active_now {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .child(div().size(px(6.)).rounded_full().bg(rgb(0x34d399)))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(0x34d399))
+                                    .child("当前生效中"),
+                            )
+                    } else {
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(0x64748b))
+                            .child("未激活")
+                    })
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("btn-switch-{}", profile.id)))
+                            .px(px(9.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .text_size(px(10.))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .cursor_pointer()
+                            .bg(if is_switching_this {
+                                rgb(0xd97706)
+                            } else if is_switching_any {
+                                rgb(0x334155)
+                            } else if active_now {
+                                rgb(0x1e293b)
+                            } else {
+                                rgb(0x2563eb)
+                            })
+                            .border_1()
+                            .border_color(if active_now {
+                                rgb(0x334155)
+                            } else if is_switching_any {
+                                rgb(0x475569)
+                            } else {
+                                rgb(0x60a5fa)
+                            })
+                            .text_color(if active_now {
+                                rgb(0x94a3b8)
+                            } else {
+                                rgb(0xffffff)
+                            })
+                            .hover(|s| {
+                                if active_now {
+                                    s.bg(rgb(0x334155)).text_color(rgb(0xf8fafc))
+                                } else {
+                                    s.bg(rgb(0x1d4ed8))
+                                }
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.apply_profile_by_id(id_for_apply.clone(), false, cx);
+                                }),
+                            )
+                            .child(if is_switching_this {
+                                "切换中..."
+                            } else if active_now {
+                                "重应用"
+                            } else {
+                                "切换"
+                            }),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1726,71 +1830,115 @@ impl Render for ConfigWindow {
                                             )
                                             .child(
                                                 div()
-                                                    .id("btn-live-toggle-ipv6")
                                                     .flex()
                                                     .items_center()
                                                     .gap(px(8.))
-                                                    .px(px(10.))
-                                                    .py(px(4.))
-                                                    .rounded(px(6.))
-                                                    .bg(if self.current_status.ipv6_enabled {
-                                                        rgb(0x064e3b)
-                                                    } else {
-                                                        rgb(0x1e293b)
-                                                    })
-                                                    .border_1()
-                                                    .border_color(
-                                                        if self.current_status.ipv6_enabled {
-                                                            rgb(0x10b981)
-                                                        } else {
-                                                            rgb(0x475569)
-                                                        },
-                                                    )
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.border_color(rgb(0x93c5fd)))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(|this, _, _, cx| {
-                                                            this.toggle_active_adapter_ipv6(cx);
-                                                        }),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(11.))
-                                                            .text_color(rgb(0xf8fafc))
-                                                            .child(
-                                                                if self.current_status.ipv6_enabled
-                                                                {
-                                                                    "IPv6: 已开启"
+                                                    .when(active_profiles.len() >= 2, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .id("btn-live-cycle-next")
+                                                                .px(px(10.))
+                                                                .py(px(4.))
+                                                                .rounded(px(6.))
+                                                                .bg(if is_switching {
+                                                                    rgb(0x334155)
                                                                 } else {
-                                                                    "IPv6: 已关闭"
-                                                                },
-                                                            ),
-                                                    )
+                                                                    rgb(0x2563eb)
+                                                                })
+                                                                .text_size(px(11.))
+                                                                .font_weight(
+                                                                    gpui::FontWeight::MEDIUM,
+                                                                )
+                                                                .text_color(rgb(0xffffff))
+                                                                .cursor_pointer()
+                                                                .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(|this, _, _, cx| {
+                                                                        this.apply_next_profile(cx);
+                                                                    }),
+                                                                )
+                                                                .child("一键切换下一套"),
+                                                        )
+                                                    })
                                                     .child(
                                                         div()
-                                                            .w(px(32.))
-                                                            .h(px(17.))
-                                                            .rounded_full()
-                                                            .p(px(2.))
+                                                            .id("btn-live-toggle-ipv6")
                                                             .flex()
                                                             .items_center()
+                                                            .gap(px(8.))
+                                                            .px(px(10.))
+                                                            .py(px(4.))
+                                                            .rounded(px(6.))
                                                             .bg(if self.current_status.ipv6_enabled
                                                             {
-                                                                rgb(0x10b981)
+                                                                rgb(0x064e3b)
                                                             } else {
-                                                                rgb(0x475569)
+                                                                rgb(0x1e293b)
                                                             })
-                                                            .justify_end()
-                                                            .when(
-                                                                !self.current_status.ipv6_enabled,
-                                                                |this| this.justify_start(),
+                                                            .border_1()
+                                                            .border_color(
+                                                                if self.current_status.ipv6_enabled
+                                                                {
+                                                                    rgb(0x10b981)
+                                                                } else {
+                                                                    rgb(0x475569)
+                                                                },
+                                                            )
+                                                            .cursor_pointer()
+                                                            .hover(|s| s.border_color(rgb(0x93c5fd)))
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(|this, _, _, cx| {
+                                                                    this.toggle_active_adapter_ipv6(
+                                                                        cx,
+                                                                    );
+                                                                }),
                                                             )
                                                             .child(
                                                                 div()
-                                                                    .size(px(13.))
+                                                                    .text_size(px(11.))
+                                                                    .text_color(rgb(0xf8fafc))
+                                                                    .child(
+                                                                        if self
+                                                                            .current_status
+                                                                            .ipv6_enabled
+                                                                        {
+                                                                            "IPv6: 已开启"
+                                                                        } else {
+                                                                            "IPv6: 已关闭"
+                                                                        },
+                                                                    ),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .w(px(32.))
+                                                                    .h(px(17.))
                                                                     .rounded_full()
-                                                                    .bg(rgb(0xffffff)),
+                                                                    .p(px(2.))
+                                                                    .flex()
+                                                                    .items_center()
+                                                                    .bg(if self
+                                                                        .current_status
+                                                                        .ipv6_enabled
+                                                                    {
+                                                                        rgb(0x10b981)
+                                                                    } else {
+                                                                        rgb(0x475569)
+                                                                    })
+                                                                    .justify_end()
+                                                                    .when(
+                                                                        !self
+                                                                            .current_status
+                                                                            .ipv6_enabled,
+                                                                        |this| this.justify_start(),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .size(px(13.))
+                                                                            .rounded_full()
+                                                                            .bg(rgb(0xffffff)),
+                                                                    ),
                                                             ),
                                                     ),
                                             ),
