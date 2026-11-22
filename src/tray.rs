@@ -23,7 +23,7 @@ use crate::autostart;
 use crate::config::{Config, NetworkProfile, load_config, save_config};
 use crate::icon::{OwnedIcon, TrayVisualState, create_state_icon};
 use crate::net::{
-    NetChangeWatcher, NetworkMode, NetworkStatus, apply_profile, pick_next_profile, query_status,
+    NetChangeWatcher, NetworkMode, NetworkStatus, apply_profile, query_status,
 };
 use crate::winutil::{allow_uipi_message, copy_to_wide_buf, open_file_in_shell, to_wide_null};
 
@@ -40,12 +40,11 @@ const TIMER_POLL_ID: usize = 1;
 const TIMER_DEBOUNCE_ID: usize = 2;
 
 const CMD_OPEN_GUI: u32 = 1001;
-const CMD_CYCLE_NEXT: u32 = 1002;
-const CMD_REFRESH: u32 = 1003;
-const CMD_OPEN_CONFIG: u32 = 1004;
-const CMD_RELOAD_CONFIG: u32 = 1005;
-const CMD_TOGGLE_AUTOSTART: u32 = 1006;
-const CMD_EXIT: u32 = 1007;
+const CMD_REFRESH: u32 = 1002;
+const CMD_OPEN_CONFIG: u32 = 1003;
+const CMD_RELOAD_CONFIG: u32 = 1004;
+const CMD_TOGGLE_AUTOSTART: u32 = 1005;
+const CMD_EXIT: u32 = 1006;
 const CMD_PROFILE_BASE: u32 = 2000;
 
 #[derive(Debug, Clone, Copy)]
@@ -214,18 +213,6 @@ impl AppState {
         });
     }
 
-    fn cycle_next_profile(&mut self) {
-        if self.is_switching() {
-            return;
-        }
-        self.status = query_status(&self.config);
-        if let Some(next) = pick_next_profile(&self.config, &self.status).cloned() {
-            self.start_apply_profile(next);
-        } else {
-            self.request_open_gui();
-        }
-    }
-
     fn handle_switch_done(&mut self, res: SwitchResult) {
         self.switching_to = None;
         match res.outcome {
@@ -305,7 +292,6 @@ impl AppState {
         }
 
         let autostart_on = autostart::is_enabled();
-        let next_profile = pick_next_profile(&self.config, &self.status).cloned();
 
         unsafe {
             let menu = CreatePopupMenu();
@@ -350,21 +336,6 @@ impl AppState {
             } else {
                 MF_STRING
             };
-
-            if let Some(ref next) = next_profile {
-                let cycle_label = if let Some(ref target) = self.switching_to {
-                    format!("正在切换到「{}」...", target)
-                } else {
-                    format!(
-                        "一键切换 → {} ({})",
-                        next.name,
-                        next.short_mode_summary()
-                    )
-                };
-                append_item(menu, switch_flags, CMD_CYCLE_NEXT as usize, &cycle_label);
-                SetMenuDefaultItem(menu, CMD_CYCLE_NEXT, 0);
-                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-            }
 
             let mut has_active_profiles = false;
             for (idx, p) in self.config.profiles.iter().enumerate() {
@@ -417,9 +388,7 @@ impl AppState {
                 CMD_OPEN_GUI as usize,
                 "网卡与 Profile 配置界面 (GPUI)...",
             );
-            if next_profile.is_none() {
-                SetMenuDefaultItem(menu, CMD_OPEN_GUI, 0);
-            }
+            SetMenuDefaultItem(menu, CMD_OPEN_GUI, 0);
             append_item(menu, MF_STRING, CMD_REFRESH as usize, "立即刷新状态");
             append_item(
                 menu,
@@ -466,7 +435,6 @@ impl AppState {
             }
 
             match cmd {
-                CMD_CYCLE_NEXT => self.cycle_next_profile(),
                 CMD_OPEN_GUI => self.request_open_gui(),
                 CMD_REFRESH => self.refresh_status(),
                 CMD_OPEN_CONFIG => {
@@ -605,11 +573,7 @@ unsafe extern "system" fn wnd_proc(
                 let mouse_msg = (lparam & 0xFFFF) as u32;
                 match mouse_msg {
                     WM_LBUTTONUP => {
-                        if state.config.ui.left_click_toggle {
-                            state.cycle_next_profile();
-                        } else {
-                            state.request_open_gui();
-                        }
+                        state.request_open_gui();
                     }
                     WM_RBUTTONUP | WM_CONTEXTMENU => {
                         state.show_context_menu();

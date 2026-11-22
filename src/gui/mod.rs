@@ -17,7 +17,7 @@ use crate::config::{
 };
 use crate::load_or_default_config;
 use crate::net::{
-    AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters, pick_next_profile,
+    AdapterSummary, NetworkMode, NetworkStatus, apply_profile, list_adapters,
     query_interface_status,
 };
 use crate::tray::{GuiCommand, TRAY_WINDOW_CLASS, WM_APP_RELOAD_CONFIG};
@@ -97,7 +97,6 @@ struct ConfigWindow {
     // Global UI settings
     interval_input: Entity<TextInput>,
     show_notifications: bool,
-    left_click_toggle: bool,
 }
 
 impl Focusable for ConfigWindow {
@@ -144,7 +143,6 @@ impl ConfigWindow {
         });
 
         let show_notifications = config.ui.show_notifications;
-        let left_click_toggle = config.ui.left_click_toggle;
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -172,7 +170,6 @@ impl ConfigWindow {
             v6_dns_input,
             interval_input,
             show_notifications,
-            left_click_toggle,
         }
     }
 
@@ -191,7 +188,6 @@ impl ConfigWindow {
             self.draft_config.ui.refresh_interval_seconds = v.max(3);
         }
         self.draft_config.ui.show_notifications = self.show_notifications;
-        self.draft_config.ui.left_click_toggle = self.left_click_toggle;
 
         let Some(selected_id) = self.selected_profile_id.clone() else {
             return Ok(());
@@ -581,7 +577,6 @@ impl ConfigWindow {
         }
         self.draft_config = self.saved_config.clone();
         self.show_notifications = self.draft_config.ui.show_notifications;
-        self.left_click_toggle = self.draft_config.ui.left_click_toggle;
         self.interval_input.update(cx, |i, cx| {
             i.set_text(self.draft_config.ui.refresh_interval_seconds.to_string(), cx)
         });
@@ -644,20 +639,6 @@ impl ConfigWindow {
             self.apply_profile_by_id(id, save_first, cx);
         } else {
             self.banner = Some(Banner::Error("请先在中间栏选择或新建一套 Profile".into()));
-            cx.notify();
-        }
-    }
-
-    fn apply_next_profile(&mut self, cx: &mut Context<Self>) {
-        if self.switching_profile_name.is_some() {
-            return;
-        }
-        let _ = self.sync_editor_into_draft(cx);
-        let next = pick_next_profile(&self.draft_config, &self.current_status).cloned();
-        if let Some(p) = next {
-            self.apply_profile_by_id(p.id, false, cx);
-        } else {
-            self.banner = Some(Banner::Error("当前网卡暂无可切换的 Profile，请先新建".into()));
             cx.notify();
         }
     }
@@ -1705,16 +1686,6 @@ impl Render for ConfigWindow {
             },
             cx,
         );
-        let toggle_left_click = Self::render_toggle_row(
-            "toggle-left-click",
-            "左键单击托盘图标在当前网卡 Profile 间循环切换",
-            self.left_click_toggle,
-            |this, _, _, cx| {
-                this.left_click_toggle = !this.left_click_toggle;
-                cx.notify();
-            },
-            cx,
-        );
         let interval_field =
             Self::render_field("后台轮询间隔（秒，最小 3）", self.interval_input.clone());
 
@@ -2043,37 +2014,7 @@ impl Render for ConfigWindow {
                                                                     .text_color(rgb(0xffffff))
                                                                     .child(status_badge_text),
                                                             ),
-                                                    )
-                                                    .when(active_profiles.len() >= 2, |this| {
-                                                        this.child(
-                                                            div()
-                                                                .id("btn-live-cycle-next")
-                                                                .flex_shrink_0()
-                                                                .whitespace_nowrap()
-                                                                .px(px(10.))
-                                                                .py(px(4.))
-                                                                .rounded(px(6.))
-                                                                .bg(if is_switching {
-                                                                    rgb(0x334155)
-                                                                } else {
-                                                                    rgb(0x2563eb)
-                                                                })
-                                                                .text_size(px(11.))
-                                                                .font_weight(
-                                                                    gpui::FontWeight::MEDIUM,
-                                                                )
-                                                                .text_color(rgb(0xffffff))
-                                                                .cursor_pointer()
-                                                                .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(|this, _, _, cx| {
-                                                                        this.apply_next_profile(cx);
-                                                                    }),
-                                                                )
-                                                                .child("一键切换下一套"),
-                                                        )
-                                                    }),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -2107,7 +2048,12 @@ impl Render for ConfigWindow {
                                                     .child("托盘交互设置"),
                                             )
                                             .child(toggle_notify)
-                                            .child(toggle_left_click)
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.))
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .child("左键点击托盘图标打开配置窗口，右键菜单选择 Profile 切换（已禁用图标快捷切网防误触）"),
+                                            )
                                             .child(div().w(px(200.)).pt(px(2.)).child(interval_field)),
                                     ),
                             ),

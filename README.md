@@ -16,9 +16,9 @@
   - 双击 `net-switcher.exe`：一次 UAC 提权后常驻托盘并**立刻弹出 GPUI 配置窗口**；关闭窗口后留在系统托盘常驻。
   - 重复双击 `net-switcher.exe`：不启动新进程，直接唤醒并前置已有唯一实例的配置窗口（免二次 UAC）。
   - 开机自启动：通过 Windows 任务计划带 `--minimized` 静默启动至托盘，免 UAC 且不弹窗打扰。
-- **高效交互与兼容性**：
-  - 配置窗口中栏每张 Profile 卡片均提供一键 **`切换`** 按钮，顶部状态栏提供 **`一键切换下一套`** 快捷按钮。
-  - 系统托盘左键单击可在当前网卡的多套 Profile 间顺次循环切换；右键菜单列出所有 Profile，生效项带勾选，点击直达。
+- **明确可控的切换方式（防误触）**：
+  - 配置窗口中栏每张 Profile 卡片提供明确的一键 **`切换`** 按钮，底部提供 **`保存并应用选中 Profile`**。
+  - 系统托盘左键点击打开/前置 GPUI 配置窗口（无快捷盲切），右键菜单列出所有 Profile，生效项带勾选，明确选择后切换。
   - 自动无损兼容并迁移旧版 v1 / v2 `config.json` 配置。
 
 ## 命令行参数
@@ -71,8 +71,7 @@
   ],
   "ui": {
     "showNotifications": true,
-    "refreshIntervalSeconds": 15,
-    "leftClickToggle": true
+    "refreshIntervalSeconds": 15
   }
 }
 ```

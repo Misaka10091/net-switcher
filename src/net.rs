@@ -461,31 +461,6 @@ fn match_adapter_profile<'a>(
     }
 }
 
-pub fn pick_next_profile<'a>(
-    config: &'a Config,
-    current: &NetworkStatus,
-) -> Option<&'a NetworkProfile> {
-    let profiles = config.active_profiles();
-    if profiles.is_empty() {
-        return None;
-    }
-    if profiles.len() == 1 {
-        return Some(profiles[0]);
-    }
-
-    if let Some(ref active_id) = current.matched_profile_id {
-        if let Some(idx) = profiles.iter().position(|p| p.id == *active_id) {
-            return Some(profiles[(idx + 1) % profiles.len()]);
-        }
-    }
-
-    profiles
-        .iter()
-        .copied()
-        .find(|p| p.ipv4.is_dhcp() != current.dhcp_enabled)
-        .or_else(|| Some(profiles[0]))
-}
-
 pub fn apply_profile(
     profile: &NetworkProfile,
     all_profiles: &[NetworkProfile],
@@ -1037,40 +1012,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cycles_between_multiple_profiles() {
-        let cfg = Config {
-            version: 3,
-            active_interface: "WLAN".to_string(),
-            profiles: vec![
-                NetworkProfile {
-                    id: "p1".to_string(),
-                    name: "静态 A".to_string(),
-                    interface_name: "WLAN".to_string(),
-                    ipv4: Ipv4Config::Static {
-                        ip: "192.168.1.10".to_string(),
-                        subnet_mask: "255.255.255.0".to_string(),
-                        gateway: "192.168.1.2".to_string(),
-                        gateway_metric: 0,
-                        dns: vec!["192.168.1.1".to_string()],
-                    },
-                    ipv6: Ipv6Config::Disabled,
+    fn matches_adapter_dual_stack_profile() {
+        let profiles = vec![
+            NetworkProfile {
+                id: "p1".to_string(),
+                name: "静态 A".to_string(),
+                interface_name: "WLAN".to_string(),
+                ipv4: Ipv4Config::Static {
+                    ip: "192.168.1.10".to_string(),
+                    subnet_mask: "255.255.255.0".to_string(),
+                    gateway: "192.168.1.2".to_string(),
+                    gateway_metric: 0,
+                    dns: vec!["192.168.1.1".to_string()],
                 },
-                NetworkProfile {
-                    id: "p2".to_string(),
-                    name: "DHCP 双栈".to_string(),
-                    interface_name: "WLAN".to_string(),
-                    ipv4: Ipv4Config::Dhcp {
-                        renew_on_switch: true,
-                    },
-                    ipv6: Ipv6Config::Dhcp,
+                ipv6: Ipv6Config::Disabled,
+            },
+            NetworkProfile {
+                id: "p2".to_string(),
+                name: "DHCP 双栈".to_string(),
+                interface_name: "WLAN".to_string(),
+                ipv4: Ipv4Config::Dhcp {
+                    renew_on_switch: true,
                 },
-            ],
-            ui: Default::default(),
-        };
+                ipv6: Ipv6Config::Dhcp,
+            },
+        ];
 
-        let status = NetworkStatus {
-            interface_name: "WLAN".to_string(),
-            found: true,
+        let adapter = AdapterSummary {
+            friendly_name: "WLAN".to_string(),
+            description: "Wi-Fi".to_string(),
             is_up: true,
             ipv4_enabled: true,
             dhcp_enabled: false,
@@ -1083,12 +1053,10 @@ mod tests {
             ipv6_prefix: None,
             ipv6_gateway: None,
             ipv6_dns: Vec::new(),
-            mode: NetworkMode::Static,
-            matched_profile_id: Some("p1".to_string()),
-            matched_profile_name: Some("静态 A".to_string()),
         };
 
-        let next = pick_next_profile(&cfg, &status).unwrap();
-        assert_eq!(next.id, "p2");
+        let (mode, matched) = match_adapter_profile(&adapter, &profiles);
+        assert_eq!(mode, NetworkMode::Static);
+        assert_eq!(matched.unwrap().id, "p1");
     }
 }

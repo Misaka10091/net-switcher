@@ -137,8 +137,6 @@ pub struct UiConfig {
     pub show_notifications: bool,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_seconds: u32,
-    #[serde(default = "default_true")]
-    pub left_click_toggle: bool,
 }
 
 impl Default for UiConfig {
@@ -146,7 +144,6 @@ impl Default for UiConfig {
         Self {
             show_notifications: true,
             refresh_interval_seconds: 15,
-            left_click_toggle: true,
         }
     }
 }

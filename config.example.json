@@ -35,7 +35,6 @@
   ],
   "ui": {
     "showNotifications": true,
-    "refreshIntervalSeconds": 15,
-    "leftClickToggle": true
+    "refreshIntervalSeconds": 15
   }
 }
