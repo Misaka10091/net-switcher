@@ -608,6 +608,8 @@ impl Render for TextInput {
             .flex()
             .items_center()
             .w_full()
+            .min_w(px(0.))
+            .overflow_hidden()
             .h(px(34.))
             .px(px(10.))
             .rounded(px(6.))

@@ -791,6 +791,8 @@ impl ConfigWindow {
 
         div()
             .id(SharedString::from(format!("adapter-{}", adapter.friendly_name)))
+            .w_full()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .gap(px(4.))
@@ -813,14 +815,18 @@ impl ConfigWindow {
                     .items_center()
                     .justify_between()
                     .gap(px(6.))
+                    .min_w(px(0.))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
-                            .child(div().size(px(8.)).rounded_full().bg(dot_color))
+                            .flex_1()
+                            .min_w(px(0.))
+                            .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(dot_color))
                             .child(
                                 div()
+                                    .truncate()
                                     .text_size(px(13.))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(rgb(0xf8fafc))
@@ -830,6 +836,7 @@ impl ConfigWindow {
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .gap(px(4.))
                             .child(
                                 div()
@@ -855,13 +862,16 @@ impl ConfigWindow {
             )
             .child(
                 div()
+                    .w_full()
+                    .truncate()
                     .text_size(px(11.))
                     .text_color(rgb(0x94a3b8))
-                    .overflow_hidden()
                     .child(adapter.description.clone()),
             )
             .child(
                 div()
+                    .w_full()
+                    .truncate()
                     .text_size(px(11.))
                     .text_color(rgb(0xcbd5e1))
                     .child(format!("{} · {}", v4_text, v6_text)),
@@ -892,6 +902,8 @@ impl ConfigWindow {
 
         div()
             .id(SharedString::from(format!("profile-{}", profile.id)))
+            .w_full()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .gap(px(5.))
@@ -916,21 +928,16 @@ impl ConfigWindow {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xf8fafc))
-                            .child(if profile.name.is_empty() {
-                                "(未命名 Profile)".to_string()
-                            } else {
-                                profile.name.clone()
-                            }),
-                    ),
+                    .w_full()
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xf8fafc))
+                    .child(if profile.name.is_empty() {
+                        "(未命名 Profile)".to_string()
+                    } else {
+                        profile.name.clone()
+                    }),
             )
             .child(
                 div()
@@ -959,6 +966,8 @@ impl ConfigWindow {
             )
             .child(
                 div()
+                    .w_full()
+                    .truncate()
                     .text_size(px(11.))
                     .text_color(rgb(0x94a3b8))
                     .child(profile.ipv4.summary()),
@@ -1050,6 +1059,7 @@ impl ConfigWindow {
             .flex_col()
             .gap(px(4.))
             .flex_1()
+            .min_w(px(0.))
             .child(
                 div()
                     .text_size(px(11.))
@@ -1069,14 +1079,19 @@ impl ConfigWindow {
     ) -> AnyElement {
         div()
             .id(id)
+            .w_full()
+            .min_w(px(0.))
             .flex()
             .items_center()
             .justify_between()
+            .gap(px(12.))
             .py(px(4.))
             .cursor_pointer()
             .on_mouse_down(MouseButton::Left, cx.listener(on_toggle))
             .child(
                 div()
+                    .flex_1()
+                    .min_w(px(0.))
                     .text_size(px(12.))
                     .text_color(rgb(0xe2e8f0))
                     .child(label.to_string()),
@@ -1085,6 +1100,7 @@ impl ConfigWindow {
                 div()
                     .w(px(38.))
                     .h(px(20.))
+                    .flex_shrink_0()
                     .rounded_full()
                     .p(px(2.))
                     .flex()
@@ -1109,9 +1125,12 @@ impl ConfigWindow {
         div()
             .id(id)
             .flex_1()
+            .min_w(px(0.))
             .py(px(6.))
+            .px(px(6.))
             .rounded(px(6.))
             .text_center()
+            .whitespace_nowrap()
             .text_size(px(12.))
             .font_weight(gpui::FontWeight::MEDIUM)
             .cursor_pointer()
@@ -1223,11 +1242,15 @@ impl ConfigWindow {
 
         let v4_detail: AnyElement = match self.v4_kind {
             Ipv4Kind::Static => div()
+                .w_full()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap(px(8.))
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex()
                         .gap(px(10.))
                         .child(Self::render_field("IPv4 地址", self.v4_ip_input.clone()))
@@ -1235,6 +1258,8 @@ impl ConfigWindow {
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex()
                         .gap(px(10.))
                         .child(Self::render_field(
@@ -1273,6 +1298,8 @@ impl ConfigWindow {
                 )
                 .into_any_element(),
             Ipv4Kind::Dhcp => div()
+                .w_full()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap(px(6.))
@@ -1281,6 +1308,8 @@ impl ConfigWindow {
                 .bg(rgb(0x0b1220))
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .text_size(px(11.))
                         .text_color(rgb(0x94a3b8))
                         .child("应用此 Profile 时，将 IPv4 地址、网关与 DNS 设为自动获取。"),
@@ -1298,12 +1327,14 @@ impl ConfigWindow {
                 ))
                 .into_any_element(),
             Ipv4Kind::Disabled => div()
+                .w_full()
+                .min_w(px(0.))
                 .p(px(10.))
                 .rounded(px(6.))
                 .bg(rgb(0x0b1220))
                 .text_size(px(11.))
                 .text_color(rgb(0xfdba74))
-                .child("应用此 Profile 时，将禁用该网卡的 TCP/IPv4 绑定 (ms_tcpip)。仅在点击「切换 / 应用」时生效。")
+                .child("应用此 Profile 时禁用 TCP/IPv4 (ms_tcpip)，仅在点击切换/应用时生效。")
                 .into_any_element(),
         };
 
@@ -1338,30 +1369,39 @@ impl ConfigWindow {
 
         let v6_detail: AnyElement = match self.v6_kind {
             Ipv6Kind::Dhcp => div()
+                .w_full()
+                .min_w(px(0.))
                 .p(px(10.))
                 .rounded(px(6.))
                 .bg(rgb(0x0b1220))
                 .text_size(px(11.))
                 .text_color(rgb(0x94a3b8))
-                .child("应用此 Profile 时，将启用 IPv6 并设为自动获取 (SLAAC / DHCPv6 / 自动 DNS)。")
+                .child("应用此 Profile 时启用 IPv6 并设为自动获取 (SLAAC / DHCPv6)。")
                 .into_any_element(),
             Ipv6Kind::Static => div()
+                .w_full()
+                .min_w(px(0.))
                 .flex()
                 .flex_col()
                 .gap(px(8.))
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex()
                         .gap(px(10.))
                         .child(Self::render_field("IPv6 地址", self.v6_ip_input.clone()))
                         .child(
                             div()
-                                .w(px(120.))
+                                .w(px(110.))
+                                .flex_shrink_0()
                                 .child(Self::render_field("前缀长度", self.v6_prefix_input.clone())),
                         ),
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w(px(0.))
                         .flex()
                         .gap(px(10.))
                         .child(Self::render_field(
@@ -1396,16 +1436,20 @@ impl ConfigWindow {
                 )
                 .into_any_element(),
             Ipv6Kind::Disabled => div()
+                .w_full()
+                .min_w(px(0.))
                 .p(px(10.))
                 .rounded(px(6.))
                 .bg(rgb(0x0b1220))
                 .text_size(px(11.))
                 .text_color(rgb(0xfdba74))
-                .child("应用此 Profile 时，将禁用该网卡的 TCP/IPv6 绑定 (ms_tcpip6)。仅在点击「切换 / 应用」时生效。")
+                .child("应用此 Profile 时禁用 TCP/IPv6 (ms_tcpip6)，仅在点击切换/应用时生效。")
                 .into_any_element(),
         };
 
         div()
+            .w_full()
+            .min_w(px(0.))
             .flex()
             .flex_col()
             .gap(px(12.))
@@ -1416,19 +1460,26 @@ impl ConfigWindow {
             .border_color(rgb(0x1e293b))
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.))
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(8.))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
                             .text_size(px(13.))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(0xe2e8f0))
-                            .child("Profile 详细配置（IPv4 与 IPv6 独立设置，应用时统一生效）"),
+                            .child("Profile 详细配置"),
                     )
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .gap(px(6.))
                             .child(
                                 div()
@@ -1478,6 +1529,8 @@ impl ConfigWindow {
             // IPv4 Section
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -1495,6 +1548,8 @@ impl ConfigWindow {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
                             .flex()
                             .gap(px(8.))
                             .child(v4_btn_static)
@@ -1506,6 +1561,8 @@ impl ConfigWindow {
             // IPv6 Section
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.))
                     .flex()
                     .flex_col()
                     .gap(px(8.))
@@ -1523,6 +1580,8 @@ impl ConfigWindow {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w(px(0.))
                             .flex()
                             .gap(px(8.))
                             .child(v6_btn_dhcp)
@@ -1678,9 +1737,12 @@ impl Render for ConfigWindow {
             // Header
             .child(
                 div()
+                    .w_full()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap(px(12.))
                     .px(px(18.))
                     .py(px(13.))
                     .bg(rgb(0x111827))
@@ -1690,6 +1752,8 @@ impl Render for ConfigWindow {
                         div()
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_w(px(0.))
                             .gap(px(2.))
                             .child(
                                 div()
@@ -1705,6 +1769,7 @@ impl Render for ConfigWindow {
                                     )
                                     .child(
                                         div()
+                                            .flex_shrink_0()
                                             .px(px(8.))
                                             .py(px(2.))
                                             .rounded(px(4.))
@@ -1724,6 +1789,8 @@ impl Render for ConfigWindow {
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .truncate()
                                     .text_size(px(11.))
                                     .text_color(rgb(0x94a3b8))
                                     .child(format!(
@@ -1735,6 +1802,8 @@ impl Render for ConfigWindow {
                     .child(
                         div()
                             .id("btn-refresh-adapters")
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
                             .px(px(12.))
                             .py(px(6.))
                             .rounded(px(6.))
@@ -1755,15 +1824,20 @@ impl Render for ConfigWindow {
             // Body (Three Columns)
             .child(
                 div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
                     .flex()
                     .flex_1()
-                    .min_h(px(0.))
+                    .overflow_hidden()
                     .gap(px(12.))
                     .p(px(14.))
                     // Column 1: Network Adapters
                     .child(
                         div()
-                            .w(px(235.))
+                            .w(px(225.))
+                            .flex_shrink_0()
+                            .overflow_hidden()
                             .flex()
                             .flex_col()
                             .gap(px(8.))
@@ -1794,10 +1868,12 @@ impl Render for ConfigWindow {
                             .child(
                                 div()
                                     .id("adapter-list-scroll")
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .min_h(px(0.))
                                     .flex()
                                     .flex_col()
                                     .flex_1()
-                                    .min_h(px(0.))
                                     .gap(px(7.))
                                     .overflow_y_scroll()
                                     .children(adapter_cards),
@@ -1806,7 +1882,9 @@ impl Render for ConfigWindow {
                     // Column 2: Profiles
                     .child(
                         div()
-                            .w(px(245.))
+                            .w(px(235.))
+                            .flex_shrink_0()
+                            .overflow_hidden()
                             .flex()
                             .flex_col()
                             .gap(px(8.))
@@ -1837,10 +1915,12 @@ impl Render for ConfigWindow {
                             .child(
                                 div()
                                     .id("profile-list-scroll")
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .min_h(px(0.))
                                     .flex()
                                     .flex_col()
                                     .flex_1()
-                                    .min_h(px(0.))
                                     .gap(px(7.))
                                     .overflow_y_scroll()
                                     .children(profile_cards),
@@ -1894,117 +1974,151 @@ impl Render for ConfigWindow {
                     // Column 3: Live Status (read-only) + Editor + Tray Settings
                     .child(
                         div()
-                            .id("right-config-scroll")
-                            .flex()
-                            .flex_col()
                             .flex_1()
+                            .min_w(px(0.))
                             .min_h(px(0.))
-                            .gap(px(10.))
-                            .overflow_y_scroll()
-                            // Live Status Card (read-only display + cycle next)
+                            .overflow_hidden()
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
-                                    .p(px(12.))
-                                    .rounded(px(10.))
-                                    .bg(rgb(0x111827))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
+                                    .id("right-config-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
                                     .child(
                                         div()
+                                            .w_full()
+                                            .min_w(px(0.))
                                             .flex()
-                                            .items_center()
-                                            .justify_between()
+                                            .flex_col()
+                                            .gap(px(10.))
+                                            .pr(px(4.))
+                                    // Live Status Card (read-only display + cycle next)
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.))
+                                            .p(px(12.))
+                                            .rounded(px(10.))
+                                            .bg(rgb(0x111827))
+                                            .border_1()
+                                            .border_color(rgb(0x1e293b))
                                             .child(
                                                 div()
+                                                    .w_full()
+                                                    .min_w(px(0.))
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
                                                     .gap(px(8.))
                                                     .child(
                                                         div()
-                                                            .text_size(px(13.))
-                                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                            .child(format!(
-                                                                "网卡实时状态: {}",
-                                                                active_iface
-                                                            )),
+                                                            .flex()
+                                                            .items_center()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .gap(px(8.))
+                                                            .child(
+                                                                div()
+                                                                    .truncate()
+                                                                    .text_size(px(13.))
+                                                                    .font_weight(
+                                                                        gpui::FontWeight::SEMIBOLD,
+                                                                    )
+                                                                    .child(format!(
+                                                                        "网卡实时状态: {}",
+                                                                        active_iface
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .flex_shrink_0()
+                                                                    .whitespace_nowrap()
+                                                                    .px(px(8.))
+                                                                    .py(px(2.))
+                                                                    .rounded(px(4.))
+                                                                    .bg(mode_color)
+                                                                    .text_size(px(11.))
+                                                                    .text_color(rgb(0xffffff))
+                                                                    .child(status_badge_text),
+                                                            ),
                                                     )
-                                                    .child(
-                                                        div()
-                                                            .px(px(8.))
-                                                            .py(px(2.))
-                                                            .rounded(px(4.))
-                                                            .bg(mode_color)
-                                                            .text_size(px(11.))
-                                                            .text_color(rgb(0xffffff))
-                                                            .child(status_badge_text),
-                                                    ),
-                                            )
-                                            .when(active_profiles.len() >= 2, |this| {
-                                                this.child(
-                                                    div()
-                                                        .id("btn-live-cycle-next")
-                                                        .px(px(10.))
-                                                        .py(px(4.))
-                                                        .rounded(px(6.))
-                                                        .bg(if is_switching {
-                                                            rgb(0x334155)
-                                                        } else {
-                                                            rgb(0x2563eb)
-                                                        })
-                                                        .text_size(px(11.))
-                                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                                        .text_color(rgb(0xffffff))
-                                                        .cursor_pointer()
-                                                        .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(|this, _, _, cx| {
-                                                                this.apply_next_profile(cx);
-                                                            }),
+                                                    .when(active_profiles.len() >= 2, |this| {
+                                                        this.child(
+                                                            div()
+                                                                .id("btn-live-cycle-next")
+                                                                .flex_shrink_0()
+                                                                .whitespace_nowrap()
+                                                                .px(px(10.))
+                                                                .py(px(4.))
+                                                                .rounded(px(6.))
+                                                                .bg(if is_switching {
+                                                                    rgb(0x334155)
+                                                                } else {
+                                                                    rgb(0x2563eb)
+                                                                })
+                                                                .text_size(px(11.))
+                                                                .font_weight(
+                                                                    gpui::FontWeight::MEDIUM,
+                                                                )
+                                                                .text_color(rgb(0xffffff))
+                                                                .cursor_pointer()
+                                                                .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(|this, _, _, cx| {
+                                                                        this.apply_next_profile(cx);
+                                                                    }),
+                                                                )
+                                                                .child("一键切换下一套"),
                                                         )
-                                                        .child("一键切换下一套"),
-                                                )
-                                            }),
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w_full()
+                                                    .min_w(px(0.))
+                                                    .text_size(px(12.))
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .child(self.current_status.summary_line()),
+                                            ),
                                     )
+                                    // Profile Editor Card
+                                    .child(editor_card)
+                                    // Global Tray Behavior Card
                                     .child(
                                         div()
-                                            .text_size(px(12.))
-                                            .text_color(rgb(0x94a3b8))
-                                            .child(self.current_status.summary_line()),
+                                            .w_full()
+                                            .min_w(px(0.))
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(6.))
+                                            .p(px(12.))
+                                            .rounded(px(10.))
+                                            .bg(rgb(0x111827))
+                                            .border_1()
+                                            .border_color(rgb(0x1e293b))
+                                            .child(
+                                                div()
+                                                    .text_size(px(13.))
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .text_color(rgb(0xe2e8f0))
+                                                    .child("托盘交互设置"),
+                                            )
+                                            .child(toggle_notify)
+                                            .child(toggle_left_click)
+                                            .child(div().w(px(200.)).pt(px(2.)).child(interval_field)),
                                     ),
-                            )
-                            // Profile Editor Card
-                            .child(editor_card)
-                            // Global Tray Behavior Card
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.))
-                                    .p(px(12.))
-                                    .rounded(px(10.))
-                                    .bg(rgb(0x111827))
-                                    .border_1()
-                                    .border_color(rgb(0x1e293b))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(rgb(0xe2e8f0))
-                                            .child("托盘交互设置"),
-                                    )
-                                    .child(toggle_notify)
-                                    .child(toggle_left_click)
-                                    .child(div().w(px(200.)).pt(px(2.)).child(interval_field)),
                             ),
+                        ),
                     ),
             )
             // Footer Action Bar
             .child(
                 div()
+                    .w_full()
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .justify_between()
@@ -2014,29 +2128,32 @@ impl Render for ConfigWindow {
                     .bg(rgb(0x111827))
                     .border_t_1()
                     .border_color(rgb(0x1e293b))
-                    .child(div().flex_1().text_size(px(12.)).child(
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_size(px(12.)).child(
                         match &self.banner {
                             Some(Banner::Info(msg)) => {
-                                div().text_color(rgb(0x93c5fd)).child(msg.clone())
+                                div().truncate().text_color(rgb(0x93c5fd)).child(msg.clone())
                             }
                             Some(Banner::Success(msg)) => {
-                                div().text_color(rgb(0x34d399)).child(msg.clone())
+                                div().truncate().text_color(rgb(0x34d399)).child(msg.clone())
                             }
                             Some(Banner::Error(msg)) => {
-                                div().text_color(rgb(0xf87171)).child(msg.clone())
+                                div().truncate().text_color(rgb(0xf87171)).child(msg.clone())
                             }
                             None => div()
+                                .truncate()
                                 .text_color(rgb(0x64748b))
-                                .child("修改 IPv4/IPv6 配置仅保存在 Profile 中，点击「切换」或「保存并应用」时统一生效"),
+                                .child("修改 IPv4/IPv6 仅保存在 Profile，点击「切换 / 应用」时统一生效"),
                         },
                     ))
                     .child(
                         div()
                             .flex()
+                            .flex_shrink_0()
                             .gap(px(8.))
                             .child(
                                 div()
                                     .id("btn-reset")
+                                    .whitespace_nowrap()
                                     .px(px(12.))
                                     .py(px(7.))
                                     .rounded(px(6.))
@@ -2056,6 +2173,7 @@ impl Render for ConfigWindow {
                             .child(
                                 div()
                                     .id("btn-save-all")
+                                    .whitespace_nowrap()
                                     .px(px(14.))
                                     .py(px(7.))
                                     .rounded(px(6.))
@@ -2076,6 +2194,7 @@ impl Render for ConfigWindow {
                             .child(
                                 div()
                                     .id("btn-save-and-apply")
+                                    .whitespace_nowrap()
                                     .px(px(14.))
                                     .py(px(7.))
                                     .rounded(px(6.))
@@ -2117,7 +2236,7 @@ fn open_or_focus_window(
     }
 
     let cfg = load_or_default_config(config_path);
-    let bounds = Bounds::centered(None, size(px(1060.0), px(720.0)), cx);
+    let bounds = Bounds::centered(None, size(px(1120.0), px(720.0)), cx);
     let path_clone = config_path.clone();
 
     if let Ok(handle) = cx.open_window(
@@ -2127,7 +2246,7 @@ fn open_or_focus_window(
                 title: Some(GUI_WINDOW_TITLE.into()),
                 ..Default::default()
             }),
-            window_min_size: Some(size(px(880.0), px(580.0))),
+            window_min_size: Some(size(px(920.0), px(580.0))),
             ..Default::default()
         },
         |window, cx| {
